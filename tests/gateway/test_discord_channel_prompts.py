@@ -102,6 +102,15 @@ def _make_source() -> SessionSource:
 
 
 class TestResolveChannelPrompts:
+    def test_channel_ancestor_ids_include_category_for_channel_and_thread(self):
+        adapter = _make_adapter()
+        category = SimpleNamespace(id=111, parent=None, category=None)
+        channel = SimpleNamespace(id=222, parent=None, category=category)
+        thread = SimpleNamespace(id=333, parent=channel, category=None)
+
+        assert adapter._channel_ancestor_ids(channel) == ("111",)
+        assert adapter._channel_ancestor_ids(thread) == ("222", "111")
+
     def test_no_prompt_returns_none(self):
         adapter = _make_adapter()
         assert adapter._resolve_channel_prompt("123") is None
@@ -123,6 +132,74 @@ class TestResolveChannelPrompts:
         assert adapter._resolve_channel_prompt("100") == "Research mode"
         # Pre-bridging numeric key would not match (bridging is responsible)
         adapter.config.extra = {"channel_prompts": {100: "Research mode"}}
+        assert adapter._resolve_channel_prompt("100") is None
+
+    def test_match_by_parent_id(self):
+        adapter = _make_adapter()
+        adapter.config.extra = {"channel_prompts": {"200": "Forum prompt"}}
+        assert adapter._resolve_channel_prompt("999", parent_id="200") == "Forum prompt"
+
+    def test_exact_channel_overrides_parent(self):
+        adapter = _make_adapter()
+        adapter.config.extra = {
+            "channel_prompts": {
+                "999": "Thread override",
+                "200": "Forum prompt",
+            }
+        }
+        assert adapter._resolve_channel_prompt("999", parent_id="200") == "Thread override"
+
+    def test_build_message_event_sets_channel_prompt(self):
+        adapter = _make_adapter()
+        adapter.config.extra = {"channel_prompts": {"321": "Command prompt"}}
+        adapter.build_source = MagicMock(return_value=SimpleNamespace())
+
+        category = SimpleNamespace(id=111, parent=None)
+        interaction = SimpleNamespace(
+            channel_id=321,
+            channel=SimpleNamespace(
+                id=321,
+                name="general",
+                guild=None,
+                parent_id=111,
+                parent=category,
+            ),
+            user=SimpleNamespace(id=1, display_name="Brenner"),
+        )
+        adapter._get_effective_topic = MagicMock(return_value=None)
+
+        event = adapter._build_slash_event(interaction, "/retry")
+
+        assert event.channel_prompt == "Command prompt"
+        assert adapter.build_source.call_args.kwargs["ancestor_chat_ids"] == ("111",)
+
+    @pytest.mark.asyncio
+    async def test_dispatch_thread_session_inherits_parent_channel_prompt(self):
+        adapter = _make_adapter()
+        adapter.config.extra = {"channel_prompts": {"200": "Parent prompt"}}
+        adapter.build_source = MagicMock(return_value=SimpleNamespace())
+        adapter._get_effective_topic = MagicMock(return_value=None)
+        adapter.handle_message = AsyncMock()
+
+        category = SimpleNamespace(id=111, parent=None)
+        parent = SimpleNamespace(id=200, parent=category)
+        interaction = SimpleNamespace(
+            guild=SimpleNamespace(name="Wetlands"),
+            channel=parent,
+            user=SimpleNamespace(id=1, display_name="Brenner"),
+        )
+
+        await adapter._dispatch_thread_session(interaction, "999", "new-thread", "hello")
+
+        dispatched_event = adapter.handle_message.await_args.args[0]
+        source_kwargs = adapter.build_source.call_args.kwargs
+        assert source_kwargs["parent_chat_id"] == "200"
+        assert source_kwargs["ancestor_chat_ids"] == ("111",)
+        assert dispatched_event.channel_prompt == "Parent prompt"
+
+    def test_blank_prompts_are_ignored(self):
+        adapter = _make_adapter()
+        adapter.config.extra = {"channel_prompts": {"100": "   "}}
         assert adapter._resolve_channel_prompt("100") is None
 
 
@@ -152,5 +229,4 @@ async def test_retry_preserves_channel_prompt(monkeypatch):
     assert result == "ok"
     retried_event = runner._handle_message.await_args.args[0]
     assert retried_event.channel_prompt == "Channel prompt"
-
 
