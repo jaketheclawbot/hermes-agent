@@ -101,6 +101,7 @@ class TestPlatformConfigRoundtrip:
                     model="openrouter/healer-alpha",
                     provider="openrouter",
                     system_prompt="You are a daily news summarizer.",
+                    workdir="/srv/projects/alpha",
                 ),
                 "9876543210": ChannelOverride(
                     model="anthropic/claude-opus-4.6",
@@ -113,9 +114,11 @@ class TestPlatformConfigRoundtrip:
         assert "channel_overrides" in d
         assert d["channel_overrides"]["1234567890"]["model"] == "openrouter/healer-alpha"
         assert d["channel_overrides"]["9876543210"]["system_prompt"] == "You are a coding assistant."
+        assert d["channel_overrides"]["1234567890"]["workdir"] == "/srv/projects/alpha"
         restored = PlatformConfig.from_dict(d)
         assert restored.channel_overrides["1234567890"].model == "openrouter/healer-alpha"
         assert restored.channel_overrides["9876543210"].provider == "anthropic"
+        assert restored.channel_overrides["1234567890"].workdir == "/srv/projects/alpha"
 
 
 class TestChannelOverride:
@@ -788,6 +791,246 @@ class TestLoadGatewayConfig:
             "bridged into PlatformConfig.extra by the shared-key loop"
         )
 
+    def test_shared_key_loop_bridges_allow_from_from_nested_gateway_platforms(self, tmp_path, monkeypatch):
+        """Same regression check for ``gateway.platforms:`` path."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "gateway:\n"
+            "  platforms:\n"
+            "    telegram:\n"
+            "      allow_from:\n"
+            "        - \"777888999\"\n"
+            "      require_mention: false\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        telegram = config.platforms[Platform.TELEGRAM]
+        assert telegram.extra.get("allow_from") == ["777888999"], (
+            "allow_from configured under plugins.platforms.telegram.adapter must be "
+            "bridged into PlatformConfig.extra by the shared-key loop"
+        )
+        assert telegram.extra.get("require_mention") is False
+
+    def test_bridges_quoted_false_session_notify_from_config_yaml(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "session_reset:\n"
+            "  notify: \"false\"\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.default_reset_policy.notify is False
+
+    def test_bridges_quoted_false_always_log_local_from_config_yaml(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "always_log_local: \"false\"\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.always_log_local is False
+
+    def test_bridges_discord_channel_overrides_from_top_level_yaml(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "discord:\n"
+            "  channel_overrides:\n"
+            '    "1234567890":\n'
+            "      model: openrouter/healer-alpha\n"
+            "      provider: openrouter\n"
+            "      system_prompt: Daily news summarizer\n"
+            "      workdir: /srv/projects/alpha\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        discord = config.platforms[Platform.DISCORD]
+        assert "1234567890" in discord.channel_overrides
+        ov = discord.channel_overrides["1234567890"]
+        assert ov.model == "openrouter/healer-alpha"
+        assert ov.provider == "openrouter"
+        assert ov.system_prompt == "Daily news summarizer"
+        assert ov.workdir == "/srv/projects/alpha"
+
+    def test_bridges_discord_channel_prompts_from_config_yaml(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "discord:\n"
+            "  channel_prompts:\n"
+            "    \"123\": Research mode\n"
+            "    456: Therapist mode\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.platforms[Platform.DISCORD].extra["channel_prompts"] == {
+            "123": "Research mode",
+            "456": "Therapist mode",
+        }
+
+    def test_bridges_discord_history_backfill_settings_from_config_yaml(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "discord:\n"
+            "  history_backfill: true\n"
+            "  history_backfill_limit: 17\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("DISCORD_HISTORY_BACKFILL", raising=False)
+        monkeypatch.delenv("DISCORD_HISTORY_BACKFILL_LIMIT", raising=False)
+
+        load_gateway_config()
+
+        assert os.getenv("DISCORD_HISTORY_BACKFILL") == "true"
+        assert os.getenv("DISCORD_HISTORY_BACKFILL_LIMIT") == "17"
+
+    def test_bridges_telegram_channel_prompts_from_config_yaml(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "telegram:\n"
+            "  channel_prompts:\n"
+            '    "-1001234567": Research assistant\n'
+            "    789: Creative writing\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.platforms[Platform.TELEGRAM].extra["channel_prompts"] == {
+            "-1001234567": "Research assistant",
+            "789": "Creative writing",
+        }
+
+    def test_bridges_slack_channel_prompts_from_config_yaml(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "slack:\n"
+            "  channel_prompts:\n"
+            '    "C01ABC": Code review mode\n',
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.platforms[Platform.SLACK].extra["channel_prompts"] == {
+            "C01ABC": "Code review mode",
+        }
+
+    def test_bridges_feishu_allow_bots_from_config_yaml_to_env(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "feishu:\n  allow_bots: mentions\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("FEISHU_ALLOW_BOTS", raising=False)
+
+        load_gateway_config()
+
+        assert os.environ.get("FEISHU_ALLOW_BOTS") == "mentions"
+
+    def test_feishu_allow_bots_env_takes_precedence_over_config_yaml(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "feishu:\n  allow_bots: all\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("FEISHU_ALLOW_BOTS", "none")
+
+        load_gateway_config()
+
+        assert os.environ.get("FEISHU_ALLOW_BOTS") == "none"
+
+    def test_bridges_telegram_allow_bots_from_config_yaml_to_env(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "telegram:\n  allow_bots: mentions\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("TELEGRAM_ALLOW_BOTS", raising=False)
+
+        load_gateway_config()
+
+        assert os.environ.get("TELEGRAM_ALLOW_BOTS") == "mentions"
+
+    def test_telegram_allow_bots_env_takes_precedence_over_config_yaml(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "telegram:\n  allow_bots: all\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("TELEGRAM_ALLOW_BOTS", "none")
+
+        load_gateway_config()
+
+        assert os.environ.get("TELEGRAM_ALLOW_BOTS") == "none"
+
+    def test_invalid_quick_commands_in_config_yaml_are_ignored(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text("quick_commands: not-a-mapping\n", encoding="utf-8")
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.quick_commands == {}
 
     def test_bridges_unauthorized_dm_behavior_from_config_yaml(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
