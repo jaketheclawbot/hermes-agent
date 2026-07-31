@@ -723,6 +723,11 @@ class TelegramAdapter(BasePlatformAdapter):
         # can leave Bot API 10.1 rich draft frames visually overlaid until the
         # chat is redrawn, while final rich messages remain useful.
         self._rich_drafts_enabled: bool = self._coerce_bool_extra("rich_drafts", False)
+        self._cron_quick_reply_cards_enabled = self._coerce_bool_extra(
+            "cron_quick_reply_cards", True
+        )
+        from hermes_constants import get_hermes_home
+        self._cron_reply_state_path = get_hermes_home() / "state" / "telegram_cron_reply_cards.json"
         # Latched off after a capability failure on sendRichMessage /
         # sendRichMessageDraft (e.g. older python-telegram-bot without the
         # endpoint) so later sends skip the doomed rich attempt entirely.
@@ -1702,6 +1707,7 @@ class TelegramAdapter(BasePlatformAdapter):
     ) -> bool:
         return bool(
             not (metadata or {}).get("expect_edits")
+            and "cron_quick_reply_card" not in (metadata or {})
             and self._rich_eligible(content)
         )
 
@@ -4409,6 +4415,62 @@ class TelegramAdapter(BasePlatformAdapter):
         self._bot = None
         logger.info("[%s] Disconnected from Telegram", self.name)
 
+    def _cron_reply_state_load(self) -> Dict[str, Any]:
+        try:
+            data = json.loads(self._cron_reply_state_path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except FileNotFoundError:
+            return {}
+        except Exception:
+            logger.debug("[%s] Failed to read cron reply-card state", self.name, exc_info=True)
+            return {}
+
+    def _cron_reply_state_save(self, data: Dict[str, Any]) -> None:
+        try:
+            self._cron_reply_state_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._cron_reply_state_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+            atomic_replace(tmp, self._cron_reply_state_path)
+        except Exception:
+            logger.debug("[%s] Failed to write cron reply-card state", self.name, exc_info=True)
+
+    def _cron_reply_state_prune(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        now = time.time()
+        return {key: value for key, value in (data or {}).items()
+                if isinstance(value, dict) and (not value.get("expires_at") or float(value["expires_at"]) >= now)}
+
+    @staticmethod
+    def _cron_reply_key(chat_id: object, message_id: object) -> str:
+        return f"{chat_id}:{message_id}"
+
+    def _store_cron_reply_context(self, chat_id: object, message_id: object, card: Dict[str, Any]) -> None:
+        if not chat_id or not message_id or not isinstance(card, dict):
+            return
+        state = self._cron_reply_state_prune(self._cron_reply_state_load())
+        state[self._cron_reply_key(chat_id, message_id)] = {
+            "created_at": time.time(), "expires_at": time.time() + 7 * 24 * 3600,
+            "context": (f"Cron job context:\n- job_id: {card.get('job_id') or ''}\n"
+                        f"- name: {card.get('name') or ''}\n\nLatest cron output:\n"
+                        f"{str(card.get('output') or '').strip()}").strip(),
+        }
+        self._cron_reply_state_save(state)
+
+    def _lookup_cron_reply_context(self, chat_id: object, message_id: object) -> Optional[str]:
+        if not chat_id or not message_id:
+            return None
+        state = self._cron_reply_state_prune(self._cron_reply_state_load())
+        value = state.get(self._cron_reply_key(chat_id, message_id))
+        self._cron_reply_state_save(state)
+        context = value.get("context") if isinstance(value, dict) else None
+        return str(context).strip() if context else None
+
+    def _cron_reply_markup(self, metadata: Optional[Dict[str, Any]]) -> Optional[Any]:
+        if not getattr(self, "_cron_quick_reply_cards_enabled", True) or not isinstance((metadata or {}).get("cron_quick_reply_card"), dict):
+            return None
+        return InlineKeyboardMarkup([[
+            InlineKeyboardButton("💬 Reply with context", callback_data="cj:reply")
+        ]])
+
     def _should_thread_reply(self, reply_to: Optional[str], chunk_index: int) -> bool:
         """Determine if this message chunk should thread to the original message.
 
@@ -4488,6 +4550,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 ]
             
             message_ids = []
+            cron_reply_markup = self._cron_reply_markup(metadata)
             thread_id = self._metadata_thread_id(metadata)
             requested_thread_id = self._message_thread_id_for_send(thread_id)
             used_thread_fallback = False
@@ -4560,6 +4623,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                 text=chunk,
                                 parse_mode=ParseMode.MARKDOWN_V2,
                                 reply_to_message_id=reply_to_id,
+                                reply_markup=cron_reply_markup if i == 0 else None,
                                 **thread_kwargs,
                                 **self._link_preview_kwargs(),
                                 **self._notification_kwargs(metadata),
@@ -4574,6 +4638,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                     text=plain_chunk,
                                     parse_mode=None,
                                     reply_to_message_id=reply_to_id,
+                                    reply_markup=cron_reply_markup if i == 0 else None,
                                     **thread_kwargs,
                                     **self._link_preview_kwargs(),
                                     **self._notification_kwargs(metadata),
@@ -4700,6 +4765,11 @@ class TelegramAdapter(BasePlatformAdapter):
                                 continue
                         raise
                 message_ids.append(str(msg.message_id))
+                if i == 0 and cron_reply_markup is not None:
+                    self._store_cron_reply_context(
+                        chat_id, msg.message_id,
+                        (metadata or {}).get("cron_quick_reply_card") or {},
+                    )
 
             # Re-trigger typing indicator after sending a message.
             # Telegram clears the typing state when a new message is delivered,
@@ -6321,6 +6391,51 @@ class TelegramAdapter(BasePlatformAdapter):
         query_chat_type = getattr(query_chat, "type", None)
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
+
+        if data == "cj:reply":
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id, chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ You are not authorized to use this card.")
+                return
+            if not query_message:
+                await query.answer(text="Original cron message missing.")
+                return
+            cron_context = self._lookup_cron_reply_context(
+                query_chat_id, getattr(query_message, "message_id", None)
+            )
+            if not cron_context:
+                await query.answer(text="Cron context expired. Reply manually instead.")
+                return
+            await query.answer(text="Reply to the next message.")
+            try:
+                thread_kwargs = {}
+                if query_thread_id is not None:
+                    thread_kwargs = self._thread_kwargs_for_send(
+                        str(query_chat_id), str(query_thread_id),
+                        {"thread_id": str(query_thread_id)},
+                        reply_to_message_id=getattr(query_message, "message_id", None),
+                        reply_to_mode=self._reply_to_mode,
+                    )
+                helper = await self._bot.send_message(
+                    chat_id=normalize_telegram_chat_id(query_chat_id),
+                    text="💬 Reply to this message and I’ll include the cron job’s latest output as context.",
+                    reply_to_message_id=getattr(query_message, "message_id", None),
+                    **thread_kwargs, **self._notification_kwargs({}),
+                )
+                state = self._cron_reply_state_prune(self._cron_reply_state_load())
+                state[self._cron_reply_key(query_chat_id, helper.message_id)] = {
+                    "created_at": time.time(), "expires_at": time.time() + 7 * 24 * 3600,
+                    "context": cron_context,
+                }
+                self._cron_reply_state_save(state)
+            except Exception:
+                logger.error("[%s] Cron quick-reply callback failed", self.name, exc_info=True)
+            return
 
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mpg:", "mpv:", "mm:", "mc:", "mb", "mx", "mg:")):
@@ -9775,6 +9890,14 @@ class TelegramAdapter(BasePlatformAdapter):
                     except Exception:
                         reply_to_text = None
 
+        cron_reply_context = self._lookup_cron_reply_context(str(chat.id), reply_to_id) if reply_to_id else None
+        message_text = message.text or ""
+        if cron_reply_context:
+            message_text = (
+                f"[Cron reply context]\n{cron_reply_context}\n[/Cron reply context]\n\n"
+                f"User reply: {message_text}"
+            )
+
         # Per-channel/topic ephemeral prompt
         from gateway.platforms.base import resolve_channel_prompt
         _chat_id_str = str(chat.id)
@@ -9785,7 +9908,7 @@ class TelegramAdapter(BasePlatformAdapter):
         )
 
         return MessageEvent(
-            text=message.text or "",
+            text=message_text,
             message_type=msg_type,
             source=source,
             raw_message=message,
