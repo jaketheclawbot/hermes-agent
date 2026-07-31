@@ -6932,6 +6932,15 @@ def _gateway_command_inner(args):
             sys.exit(1)
 
     elif subcmd == "start":
+        if os.getenv("_HERMES_GATEWAY") == "1":
+            print_error(
+                "Refusing to start the gateway from inside the gateway process.\n"
+                "This command was blocked because gateway lifecycle operations "
+                "may interrupt the running gateway.\n"
+                "Use `hermes gateway start` from a shell outside the running gateway."
+            )
+            sys.exit(1)
+
         system = getattr(args, "system", False)
         start_all = getattr(args, "all", False)
 
