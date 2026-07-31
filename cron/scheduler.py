@@ -3650,6 +3650,11 @@ def _deliver_result(
                     "direct_messages_topic_id": str(thread_id),
                     "job_id": job["id"],
                     "notify": notify_delivery,
+                    "cron_quick_reply_card": {
+                        "job_id": job.get("id", ""),
+                        "name": job.get("name", job.get("id", "")),
+                        "output": content,
+                    },
                 }
                 # Media metadata mirrors the text routing so attachments land in
                 # the same DM topic instead of the General lane (#22773).
@@ -3667,7 +3672,15 @@ def _deliver_result(
                 # anchor, so the metadata key bypasses that check and lets the
                 # adapter route via a plain message_thread_id.
                 route_thread_id = str(thread_id) if thread_id is not None else None
-                route_metadata = {"job_id": job["id"], "notify": notify_delivery}
+                route_metadata = {
+                    "job_id": job["id"],
+                    "notify": notify_delivery,
+                    "cron_quick_reply_card": {
+                        "job_id": job.get("id", ""),
+                        "name": job.get("name", job.get("id", "")),
+                        "output": content,
+                    },
+                }
                 if route_thread_id:
                     route_metadata["thread_id"] = route_thread_id
                 media_metadata = {"notify": notify_delivery}
