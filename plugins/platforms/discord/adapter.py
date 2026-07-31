@@ -1018,6 +1018,10 @@ class DiscordAdapter(BasePlatformAdapter):
         # in those threads don't require @mention.  Persisted to disk so the
         # set survives gateway restarts.
         self._threads = ThreadParticipationTracker("discord")
+        (
+            self._thread_first_human_ids,
+            self._multi_human_threads,
+        ) = self._load_multi_human_thread_routing()
         # Persistent typing indicator loops per channel (DMs don't reliably
         # show the standard typing gateway event for bots)
         self._typing_tasks: Dict[str, asyncio.Task] = {}
@@ -1296,6 +1300,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
                 # Resolve any usernames in the allowed list to numeric IDs
                 await adapter_self._resolve_allowed_usernames()
+                await adapter_self._reconcile_multi_human_threads()
                 adapter_self._ready_event.set()
 
                 if adapter_self._post_connect_task and not adapter_self._post_connect_task.done():
@@ -1309,6 +1314,10 @@ class DiscordAdapter(BasePlatformAdapter):
             @self._client.event
             async def on_message(message: DiscordMessage):
                 await adapter_self._dispatch_discord_message(message)
+
+            @self._client.event
+            async def on_thread_member_join(member):
+                await adapter_self._handle_thread_member_join(member)
 
             @self._client.event
             async def on_voice_state_update(member, before, after):
@@ -1464,6 +1473,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 await asyncio.wait_for(self._ready_event.wait(), timeout=30.0)
             except asyncio.TimeoutError:
                 pass
+        await self._reconcile_missing_thread_participant_baseline(message.channel)
+        self._observe_discord_thread_message_participants(message)
         admitted, role_authorized = self._discord_message_admission(
             message, claim=True,
         )
@@ -6249,6 +6260,20 @@ class DiscordAdapter(BasePlatformAdapter):
             return True
         return str(self._client.user.id) in self._raw_mentioned_user_ids(message)
 
+    def _self_is_direct_reply_target(self, message: Any) -> bool:
+        """Return whether *message* directly replies to this bot."""
+        if not self._client or not self._client.user:
+            return False
+        reference = getattr(message, "reference", None)
+        target = getattr(reference, "resolved", None)
+        if target is None:
+            target = getattr(reference, "cached_message", None)
+        author = getattr(target, "author", None)
+        return str(getattr(author, "id", "")) == str(self._client.user.id)
+
+    def _self_is_addressed(self, message: Any) -> bool:
+        return self._self_is_explicitly_mentioned(message) or self._self_is_direct_reply_target(message)
+
     def _self_is_raw_mentioned(self, message: Any) -> bool:
         """Return True only when this bot has an inline mention token.
 
@@ -6349,6 +6374,148 @@ class DiscordAdapter(BasePlatformAdapter):
                 return configured.lower() not in {"false", "0", "no", "off"}
             return bool(configured)
         return os.getenv("DISCORD_THREAD_REQUIRE_MENTION", "false").lower() in {"true", "1", "yes", "on"}
+
+    def _discord_multi_human_thread_require_mention(self) -> bool:
+        """Return whether a second external participant stickily gates a thread."""
+        configured = self.config.extra.get("multi_human_thread_require_mention")
+        if configured is not None:
+            if isinstance(configured, str):
+                return configured.lower() not in {"false", "0", "no", "off"}
+            return bool(configured)
+        return os.getenv("DISCORD_MULTI_HUMAN_THREAD_REQUIRE_MENTION", "false").lower() in {
+            "true", "1", "yes", "on",
+        }
+
+    @staticmethod
+    def _multi_human_thread_routing_path() -> _Path:
+        from hermes_constants import get_hermes_home
+        return get_hermes_home() / "discord_thread_routing.json"
+
+    def _load_multi_human_thread_routing(self) -> tuple[Dict[str, str], set[str]]:
+        try:
+            data = json.loads(self._multi_human_thread_routing_path().read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return {}, set()
+        threads = data.get("threads", {}) if isinstance(data, dict) else {}
+        if not isinstance(threads, dict):
+            return {}, set()
+        baselines: Dict[str, str] = {}
+        gated: set[str] = set()
+        for thread_id, state in threads.items():
+            if not isinstance(state, dict):
+                continue
+            if state.get("first_human_id") is not None:
+                baselines[str(thread_id)] = str(state["first_human_id"])
+            if state.get("mention_required") is True:
+                gated.add(str(thread_id))
+        return baselines, gated
+
+    def _save_multi_human_thread_routing(self) -> None:
+        gated_ids = list(self._multi_human_threads)
+        baseline_ids = [key for key in self._thread_first_human_ids if key not in self._multi_human_threads]
+        capacity = max(0, 500 - len(gated_ids))
+        if len(baseline_ids) > capacity:
+            dropped = baseline_ids[:-capacity] if capacity else baseline_ids
+            for thread_id in dropped:
+                self._thread_first_human_ids.pop(thread_id, None)
+            baseline_ids = baseline_ids[-capacity:] if capacity else []
+        payload = {"threads": {
+            thread_id: {
+                "first_human_id": self._thread_first_human_ids.get(thread_id),
+                "mention_required": thread_id in self._multi_human_threads,
+            }
+            for thread_id in gated_ids + baseline_ids
+        }}
+        try:
+            atomic_json_write(self._multi_human_thread_routing_path(), payload, mode=0o600)
+        except OSError:
+            logger.warning("[%s] Could not persist Discord thread routing state", self.name, exc_info=True)
+
+    def _observe_thread_human(self, thread_id: str, user_id: str) -> bool:
+        thread_id, user_id = str(thread_id), str(user_id)
+        self_id = str(getattr(getattr(self._client, "user", None), "id", "") or "")
+        if not thread_id or not user_id or user_id == self_id:
+            return thread_id in self._multi_human_threads
+        if thread_id in self._multi_human_threads:
+            return True
+        first = self._thread_first_human_ids.get(thread_id)
+        if first is None:
+            self._thread_first_human_ids[thread_id] = user_id
+            self._save_multi_human_thread_routing()
+            return False
+        if first != user_id:
+            self._multi_human_threads.add(thread_id)
+            self._save_multi_human_thread_routing()
+            return True
+        return False
+
+    def _has_thread_routing_state(self, thread_id: str) -> bool:
+        return thread_id in self._threads or thread_id in self._thread_first_human_ids or thread_id in self._multi_human_threads
+
+    def _observe_discord_thread_message_participants(self, message: Any) -> None:
+        channel = getattr(message, "channel", None)
+        if not self._discord_multi_human_thread_require_mention() or not isinstance(channel, discord.Thread):
+            return
+        thread_id = str(channel.id)
+        if not self._has_thread_routing_state(thread_id):
+            return
+        reference = getattr(message, "reference", None)
+        target = getattr(reference, "resolved", None) or getattr(reference, "cached_message", None)
+        for participant in (getattr(message, "author", None), getattr(target, "author", None)):
+            user_id = str(getattr(participant, "id", "") or "")
+            if user_id:
+                self._observe_thread_human(thread_id, user_id)
+
+    async def _reconcile_current_thread_participants(self, thread: Any) -> None:
+        thread_id = str(getattr(thread, "id", "") or "")
+        if not thread_id or not self._has_thread_routing_state(thread_id):
+            return
+        members = list(getattr(thread, "members", []) or [])
+        fetch_members = getattr(thread, "fetch_members", None)
+        if callable(fetch_members):
+            try:
+                members = list(await fetch_members())
+            except Exception:
+                logger.debug("[%s] Could not fetch Discord thread %s members; using cache", self.name, thread_id, exc_info=True)
+        for member in members:
+            self._observe_thread_human(thread_id, str(getattr(member, "id", "") or ""))
+
+    async def _reconcile_missing_thread_participant_baseline(self, channel: Any) -> None:
+        if not isinstance(channel, discord.Thread):
+            return
+        thread_id = str(getattr(channel, "id", "") or "")
+        if (not self._discord_multi_human_thread_require_mention() or not thread_id
+                or thread_id not in self._threads or thread_id in self._thread_first_human_ids
+                or thread_id in self._multi_human_threads):
+            return
+        try:
+            fetch_members = getattr(channel, "fetch_members", None)
+            if not callable(fetch_members):
+                raise RuntimeError("authoritative membership unavailable")
+            members = list(await fetch_members())
+        except Exception:
+            logger.warning("[%s] Gating Discord thread %s: participant baseline reconciliation failed", self.name, thread_id, exc_info=True)
+            self._multi_human_threads.add(thread_id)
+            self._thread_first_human_ids.pop(thread_id, None)
+            self._save_multi_human_thread_routing()
+            return
+        for member in members:
+            self._observe_thread_human(thread_id, str(getattr(member, "id", "") or ""))
+        if thread_id not in self._thread_first_human_ids and thread_id not in self._multi_human_threads:
+            self._multi_human_threads.add(thread_id)
+            self._save_multi_human_thread_routing()
+
+    async def _handle_thread_member_join(self, member: Any) -> None:
+        thread_id = str(getattr(member, "thread_id", "") or "")
+        if self._discord_multi_human_thread_require_mention() and self._has_thread_routing_state(thread_id):
+            self._observe_thread_human(thread_id, str(getattr(member, "id", "") or ""))
+
+    async def _reconcile_multi_human_threads(self) -> None:
+        if not self._discord_multi_human_thread_require_mention() or not self._client:
+            return
+        for guild in getattr(self._client, "guilds", []) or []:
+            for thread in getattr(guild, "threads", []) or []:
+                await self._reconcile_current_thread_participants(thread)
 
     def _discord_history_backfill(self) -> bool:
         """Return whether history backfill is enabled for shared sessions."""
@@ -7672,6 +7839,13 @@ class DiscordAdapter(BasePlatformAdapter):
                 or is_voice_linked_channel
             )
 
+            multi_human_gate = bool(
+                is_thread
+                and thread_id is not None
+                and self._discord_multi_human_thread_require_mention()
+                and thread_id in self._multi_human_threads
+            )
+
             # Skip the mention check if the message is in a thread where
             # the bot has previously participated (auto-created or replied in)
             # — UNLESS thread_require_mention is enabled, in which case threads
@@ -7681,10 +7855,11 @@ class DiscordAdapter(BasePlatformAdapter):
                 is_thread
                 and thread_id in self._threads
                 and not self._discord_thread_require_mention()
+                and not multi_human_gate
             )
 
-            if require_mention and not is_free_channel and not in_bot_thread:
-                if not self._self_is_explicitly_mentioned(message) and not mention_prefix:
+            if multi_human_gate or (require_mention and not is_free_channel and not in_bot_thread):
+                if not self._self_is_addressed(message) and not mention_prefix:
                     return False
         # Auto-thread: when enabled, automatically create a thread for every
         # @mention in a text channel so each conversation is isolated (like Slack).
@@ -7704,6 +7879,8 @@ class DiscordAdapter(BasePlatformAdapter):
                     thread_id = str(thread.id)
                     auto_threaded_channel = thread
                     self._threads.mark(thread_id)
+                    if self._discord_multi_human_thread_require_mention():
+                        self._observe_thread_human(thread_id, str(message.author.id))
                     # Pre-seed dedup: when _auto_create_thread creates a thread
                     # via message.create_thread(), Discord fires a second
                     # MESSAGE_CREATE event for the "thread starter message".
@@ -8066,7 +8243,16 @@ class DiscordAdapter(BasePlatformAdapter):
         # Track thread participation so the bot won't require @mention for
         # follow-up messages in threads it has already engaged in.
         if thread_id:
+            reconcile_first_engagement = (
+                self._discord_multi_human_thread_require_mention()
+                and thread_id not in self._thread_first_human_ids
+                and thread_id not in self._multi_human_threads
+            )
             self._threads.mark(thread_id)
+            if self._discord_multi_human_thread_require_mention():
+                self._observe_thread_human(thread_id, str(message.author.id))
+                if reconcile_first_engagement:
+                    await self._reconcile_current_thread_participants(message.channel)
 
         # Only live plain text messages use split-message batching. Recovery
         # candidates are already complete historical messages; coalescing them
@@ -9859,6 +10045,13 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         os.environ["DISCORD_REQUIRE_MENTION"] = str(discord_cfg["require_mention"]).lower()
     if "thread_require_mention" in discord_cfg and not os.getenv("DISCORD_THREAD_REQUIRE_MENTION"):
         os.environ["DISCORD_THREAD_REQUIRE_MENTION"] = str(discord_cfg["thread_require_mention"]).lower()
+    if (
+        "multi_human_thread_require_mention" in discord_cfg
+        and not os.getenv("DISCORD_MULTI_HUMAN_THREAD_REQUIRE_MENTION")
+    ):
+        os.environ["DISCORD_MULTI_HUMAN_THREAD_REQUIRE_MENTION"] = str(
+            discord_cfg["multi_human_thread_require_mention"]
+        ).lower()
     if "bots_require_inline_mention" in discord_cfg and not os.getenv("DISCORD_BOTS_REQUIRE_INLINE_MENTION"):
         os.environ["DISCORD_BOTS_REQUIRE_INLINE_MENTION"] = str(discord_cfg["bots_require_inline_mention"]).lower()
     platforms_cfg = yaml_cfg.get("platforms")
