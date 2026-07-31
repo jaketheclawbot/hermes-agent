@@ -60,18 +60,16 @@ class GatewayLifecycleBlocked(ValueError):
 # actual shell-command-shaped strings, not on prose.
 _GATEWAY_LIFECYCLE_PATTERN = re.compile(
     r"(?i)"
-    # Branch A: destructive `hermes gateway` operations.
-    # The destructive operations are restart, stop, and uninstall.
-    # `start` is intentionally excluded: starting a gateway from inside a
-    # gateway is benign (a no-op or "already running" error), and a
-    # legitimate cron job might start a sibling profile's gateway.
+    # Branch A: self-targeting `hermes gateway` lifecycle operations.
+    # Start can reload supervised state and interrupt its caller; uninstall is
+    # destructive. Explicit sibling-profile operations are handled separately.
     # The lookbehind (#77173): `hermes` must not be a path component or a
     # word tail. Excluding `/`, word chars, `.` and `-` keeps file paths
     # with embedded spaces (`/docs/hermes gateway restart-notes.md`) from
     # matching via the `/hermes` tail, while every real command position
     # (start of text, whitespace, `;`/`&`/`|`, `$(`, backtick, even a
     # U+FFFD from binary-content decoding) still matches.
-    r"(?:(?<![/\w.\-])hermes\s+gateway\s+(?:restart|stop|uninstall)\b)"
+    r"(?:(?<![/\w.\-])hermes\s+gateway\s+(?:start|restart|stop|uninstall)\b)"
     # Branch B: launchctl ops on a hermes-gateway label. macOS launchd
     # labels look like `ai.hermes.gateway` / `hermes-gateway`. Requiring the
     # gateway identifier prevents blocking unrelated hermes services (e.g.
@@ -123,7 +121,7 @@ _ARGV_LIST_PUNCTUATION = re.compile(r"[\[\],]+")
 
 
 # Branch A2 (#78028): the same foot-gun written with an explicit profile
-# selector — `hermes -p <profile> gateway restart|stop` / `--profile <name>`
+# selector — `hermes -p <profile> gateway start|restart|stop` / `--profile <name>`
 # / `--profile=<name>`. The selector token between `hermes` and `gateway`
 # breaks Branch A's literal adjacency. Unlike Branch A this form is NOT
 # unconditionally self-targeting: issued from inside gateway `zeus`,
@@ -131,7 +129,6 @@ _ARGV_LIST_PUNCTUATION = re.compile(r"[\[\],]+")
 # and is a legitimate fleet operation. The pattern captures the named
 # profile so `contains_gateway_lifecycle_command` can block only the
 # self-targeting shape (named profile == the profile running the guard).
-# `start` stays excluded for the same reason as Branch A.
 _PROFILE_FLAG_LIFECYCLE_PATTERN = re.compile(
     r"(?i)"
     r"hermes\s+"
@@ -143,7 +140,7 @@ _PROFILE_FLAG_LIFECYCLE_PATTERN = re.compile(
     r"(?:--profile=([^\s]+)|(?:-p|--profile)\s+([^\s]+))"
     # Any global flags between the selector and the subcommand.
     r"(?:\s+-{1,2}\S+(?:\s+\S+)?)*"
-    r"\s+gateway\s+(?:restart|stop)"
+    r"\s+gateway\s+(?:start|restart|stop)"
 )
 
 
@@ -249,7 +246,7 @@ def contains_gateway_lifecycle_command(text: str) -> bool:
     normalized = _SHELL_LINE_CONTINUATION.sub(" ", text)
     if _GATEWAY_LIFECYCLE_PATTERN.search(normalized):
         return True
-    # Profile-flag form (#78028): `hermes -p <profile> gateway restart|stop`
+    # Profile-flag form (#78028): `hermes -p <profile> gateway start|restart|stop`
     # bypasses Branch A because the selector sits between `hermes` and
     # `gateway`. It is only the same foot-gun when the named profile IS the
     # profile running the guard — sibling-profile restarts are legitimate
@@ -1409,6 +1406,6 @@ def check_gateway_lifecycle(
             "Blocked: cron job contains a gateway lifecycle command or persistent "
             "launchctl submit operation. This is blocked to prevent agent-driven "
             "SIGTERM-respawn loops under launchd/systemd supervision "
-            "(#30719). Run `hermes gateway restart` from a shell outside "
+            "(#30719). Run gateway lifecycle commands from a shell outside "
             "the running gateway instead."
         )

@@ -3159,7 +3159,8 @@ def terminal_tool(
         session_key = get_current_session_key(default="") or (task_id or "")
 
         # Hard-block: gateway lifecycle commands (systemctl/launchctl/hermes
-        # restart|stop|uninstall targeting hermes-gateway) must never run inside the
+        # start|restart|stop|uninstall targeting hermes-gateway) must never run
+        # inside the supervised gateway process.
         # gateway process itself. The restart would SIGTERM the gateway, which
         # kills this very subprocess before it can complete — the service may
         # never restart. This mirrors the `hermes gateway restart` guard in
@@ -3274,9 +3275,10 @@ def terminal_tool(
                     "output": "",
                     "exit_code": 1,
                     "error": (
-                        "Blocked: command or referenced script cannot restart, stop, or "
-                        "uninstall the gateway from inside the gateway process. The gateway would "
-                        "kill this command before it could complete (SIGTERM propagates "
+                        "Blocked: command or referenced script cannot start, restart, stop, or "
+                        "uninstall the gateway from inside the supervised gateway process. "
+                        "These operations may kill this command before it can complete "
+                        "(SIGTERM propagates "
                         "to child processes). Run `hermes gateway restart` from a "
                         "separate shell outside the running gateway."
                     ),

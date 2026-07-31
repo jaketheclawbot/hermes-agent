@@ -1,7 +1,7 @@
 """Tests for gateway restart-loop defenses (#30719).
 
 Covers:
-- Defense 1: gateway stop/restart refuse when _HERMES_GATEWAY=1
+- Defense 1: supervised gateways refuse self-targeting lifecycle operations
 - Defense 2: cron create rejects prompts containing gateway lifecycle commands
 - _contains_gateway_lifecycle_command pattern matching
 """
@@ -29,6 +29,7 @@ class TestGatewayLifecyclePattern:
         "hermes gateway restart",
         "hermes gateway stop",
         "hermes gateway uninstall",
+        "hermes gateway start",
         "hermes  gateway  restart",         # double spaces
         "Hermez Gateway Restart".lower().replace("z", "s"),  # case handled
         "HERMES GATEWAY RESTART",           # uppercase
@@ -153,12 +154,6 @@ class TestGatewayLifecyclePattern:
         "echo 'just a normal cron job'",
         "run the backup script",
         "gateway is running fine",
-        # `hermes gateway start` is benign — starting a gateway from inside a
-        # gateway is a no-op / "already running", and a legit cron job may
-        # start a sibling profile's gateway. Only restart/stop/kill are the
-        # foot-gun (#30719 lists only those).
-        "hermes gateway start",
-        "hermes gateway start --all",
         # Tightened launchctl/systemctl branches: ops on NON-gateway hermes
         # services must not be falsely blocked (the old `.*hermes` matched any
         # hermes token).
@@ -271,7 +266,7 @@ class TestGatewayLifecyclePattern:
 
 
 class TestProfileFlagGatewayLifecycle:
-    """#78028: `hermes -p <profile> gateway restart|stop` bypasses Branch A's
+    """#78028: `hermes -p <profile> gateway start|restart|stop` bypasses Branch A's
     literal adjacency, so it needs its own pattern. It is only the same
     self-termination foot-gun when the named profile IS the profile running
     the guard; sibling-profile restarts are legitimate fleet operations and
@@ -286,6 +281,8 @@ class TestProfileFlagGatewayLifecycle:
 
     @pytest.mark.parametrize("text", [
         "hermes -p zeus gateway stop",
+        "hermes -p zeus gateway start",
+        "hermes -p zeus gateway start --all",
         "hermes -p zeus gateway restart",
         "hermes --profile zeus gateway restart",
         "hermes --profile zeus gateway stop",
@@ -303,6 +300,7 @@ class TestProfileFlagGatewayLifecycle:
 
     @pytest.mark.parametrize("text", [
         "hermes -p venus gateway stop",
+        "hermes -p venus gateway start",
         "hermes -p venus gateway restart",
         "hermes --profile venus gateway restart",
         "hermes --profile=venus gateway stop",
@@ -311,14 +309,6 @@ class TestProfileFlagGatewayLifecycle:
     def test_sibling_allowed(self, text):
         assert not _contains_gateway_lifecycle_command(text), f"Should allow: {text!r}"
 
-    @pytest.mark.parametrize("text", [
-        "hermes -p zeus gateway start",
-        "hermes -p zeus gateway start --all",
-    ])
-    def test_start_still_allowed(self, text):
-        # `start` is intentionally excluded from the guard, with or without
-        # the profile flag (#30719 rationale).
-        assert not _contains_gateway_lifecycle_command(text), f"Should allow: {text!r}"
 
     def test_adjacent_form_still_blocked(self):
         # Branch A remains unconditional — the profile-flag check is an
@@ -441,6 +431,17 @@ class TestCronCreateLifecycleBlock:
 class TestGatewaySelfTargetingGuard:
     """Verify destructive gateway commands refuse inside the gateway."""
 
+    def test_start_refuses_before_service_mutation(self, monkeypatch):
+        monkeypatch.setenv("_HERMES_GATEWAY", "1")
+        import hermes_cli.gateway as gw
+        monkeypatch.setattr(
+            gw, "_dispatch_via_service_manager_if_s6",
+            lambda *_args, **_kwargs: pytest.fail("service mutation reached"),
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            gw.gateway_command(Namespace(gateway_command="start", all=False, system=False))
+        assert exc_info.value.code == 1
+
     def test_stop_refuses_inside_gateway(self, monkeypatch):
         from tools import process_registry
         monkeypatch.setattr(
@@ -528,6 +529,7 @@ class TestTerminalToolGatewayLifecycleGuard:
         "systemctl stop hermes-gateway.service",
         "hermes gateway restart",
         "hermes gateway uninstall",
+        "hermes gateway start",
         "launchctl kickstart gui/501/ai.hermes.gateway",
         "launchctl bootout gui/501/ai.hermes.gateway",
         # #62891 exact reported shape and its bootstrap sibling.
