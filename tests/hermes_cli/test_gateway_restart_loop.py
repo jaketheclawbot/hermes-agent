@@ -28,6 +28,7 @@ class TestGatewayLifecyclePattern:
     @pytest.mark.parametrize("text", [
         "hermes gateway restart",
         "hermes gateway stop",
+        "hermes gateway start",
         "hermes  gateway  restart",         # double spaces
         "Hermez Gateway Restart".lower().replace("z", "s"),  # case handled
         "HERMES GATEWAY RESTART",           # uppercase
@@ -75,12 +76,6 @@ class TestGatewayLifecyclePattern:
         "echo 'just a normal cron job'",
         "run the backup script",
         "gateway is running fine",
-        # `hermes gateway start` is benign — starting a gateway from inside a
-        # gateway is a no-op / "already running", and a legit cron job may
-        # start a sibling profile's gateway. Only restart/stop/kill are the
-        # foot-gun (#30719 lists only those).
-        "hermes gateway start",
-        "hermes gateway start --all",
         # Tightened launchctl/systemctl branches: ops on NON-gateway hermes
         # services must not be falsely blocked (the old `.*hermes` matched any
         # hermes token).
@@ -199,6 +194,17 @@ class TestCronCreateLifecycleBlock:
 class TestGatewaySelfTargetingGuard:
     """Verify hermes gateway stop/restart refuse when _HERMES_GATEWAY=1."""
 
+    def test_start_refuses_before_service_mutation(self, monkeypatch):
+        monkeypatch.setenv("_HERMES_GATEWAY", "1")
+        import hermes_cli.gateway as gw
+        monkeypatch.setattr(
+            gw, "_dispatch_via_service_manager_if_s6",
+            lambda *_args, **_kwargs: pytest.fail("service mutation reached"),
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            gw.gateway_command(Namespace(gateway_command="start", all=False, system=False))
+        assert exc_info.value.code == 1
+
     def test_stop_refuses_inside_gateway(self, monkeypatch):
         monkeypatch.setenv("_HERMES_GATEWAY", "1")
         from hermes_cli.gateway import gateway_command
@@ -269,6 +275,7 @@ class TestTerminalToolGatewayLifecycleGuard:
         "systemctl --user restart hermes-gateway",
         "systemctl stop hermes-gateway.service",
         "hermes gateway restart",
+        "hermes gateway start",
         "launchctl kickstart gui/501/ai.hermes.gateway",
         # #62891 exact reported shape and its bootstrap sibling.
         "launchctl submit -l ai.hermes.gateway-hard-restart-no-photon-notice -- /bin/sh ~/.hermes/scripts/hard_restart_gateway_no_photon_notice.sh",
