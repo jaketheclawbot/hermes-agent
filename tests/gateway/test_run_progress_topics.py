@@ -131,6 +131,24 @@ class SmallLimitProgressAdapter(ProgressCaptureAdapter):
         return SendResult(success=True, message_id=message_id)
 
 
+class OrderedProgressAdapter(SmallLimitProgressAdapter):
+    """Capture send/edit chronology across queued logical turns."""
+
+    MAX_MESSAGE_LENGTH = 500
+
+    def __init__(self, platform=Platform.DISCORD):
+        super().__init__(platform=platform)
+        self.timeline = []
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        self.timeline.append(("send", content))
+        return await super().send(chat_id, content, reply_to, metadata)
+
+    async def edit_message(self, chat_id, message_id, content) -> SendResult:
+        self.timeline.append(("edit", content))
+        return await super().edit_message(chat_id, message_id, content)
+
+
 class Utf16SmallLimitProgressAdapter(SmallLimitProgressAdapter):
     """Small adapter whose platform limit is measured in UTF-16 units."""
 
@@ -868,6 +886,22 @@ class SlowToolAgent:
         }
 
 
+class InstantToolAgent:
+    """Finish immediately after emitting one tool event."""
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        self.tool_progress_callback("tool.started", "terminal", "instant command", {})
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 class PreviewedResponseAgent:
     def __init__(self, **kwargs):
         self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
@@ -1393,6 +1427,80 @@ async def test_rolling_progress_routes_heartbeat_into_same_activity_bubble(
     assert adapter.edits
     assert "Working — 0 min" in adapter.edits[-1]["content"]
     assert {call["message_id"] for call in adapter.edits} == {"progress-1"}
+
+
+@pytest.mark.asyncio
+async def test_rolling_progress_always_flushes_terminal_header_for_instant_turns(
+    monkeypatch, tmp_path
+):
+    for index in range(20):
+        adapter, result = await _run_with_agent(
+            monkeypatch,
+            tmp_path,
+            InstantToolAgent,
+            session_id=f"sess-progress-rolling-instant-{index}",
+            config_data={
+                "display": {
+                    "tool_progress": "all",
+                    "tool_progress_grouping": "rolling",
+                    "interim_assistant_messages": False,
+                }
+            },
+            platform=Platform.DISCORD,
+            chat_id="C123",
+            chat_type="group",
+            thread_id="thread-1",
+        )
+
+        assert result["final_response"] == "done"
+        assert len(adapter.sent) == 1
+        final_progress = (
+            adapter.edits[-1]["content"]
+            if adapter.edits
+            else adapter.sent[-1]["content"]
+        )
+        assert final_progress.startswith("✅ Completed")
+
+
+@pytest.mark.asyncio
+async def test_rolling_queued_followup_starts_after_parent_terminal_flush(
+    monkeypatch, tmp_path
+):
+    QueuedCommentaryAgent.calls = 0
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        QueuedCommentaryAgent,
+        session_id="sess-progress-rolling-queued-order",
+        pending_text="follow up",
+        config_data={
+            "display": {
+                "tool_progress": "all",
+                "tool_progress_grouping": "rolling",
+                "interim_assistant_messages": True,
+            }
+        },
+        platform=Platform.DISCORD,
+        chat_id="C123",
+        chat_type="group",
+        thread_id="thread-1",
+        adapter_cls=OrderedProgressAdapter,
+    )
+
+    assert result["final_response"] == "final response 2"
+    parent_terminal = next(
+        index
+        for index, (_, content) in enumerate(adapter.timeline)
+        if content.startswith("✅ Completed")
+    )
+    child_start = next(
+        index
+        for index, (_, content) in enumerate(
+            adapter.timeline[parent_terminal + 1 :], parent_terminal + 1
+        )
+        if content.startswith("⏳ Working…")
+    )
+    assert parent_terminal < child_start
 
 
 @pytest.mark.asyncio
