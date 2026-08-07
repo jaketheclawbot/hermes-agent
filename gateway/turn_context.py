@@ -46,6 +46,10 @@ class TurnContext:
     # --- queues ----------------------------------------------------------
     progress_queue: Any = None
     log_queue: Any = None
+    # Set before enqueueing the rolling terminal sentinel. The progress
+    # sender uses this to bypass edit throttling while it drains every event
+    # that preceded the terminal state, then exits after the final edit.
+    progress_finish_header: list = field(default_factory=lambda: [None])
 
     # --- mutable single-element containers (shared with the outer body) --
     last_progress_msg: list = field(default_factory=lambda: [None])

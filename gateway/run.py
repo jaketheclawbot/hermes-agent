@@ -4179,6 +4179,12 @@ class TurnRunner:
                     return
 
                 raw = ctx.progress_queue.get_nowait()
+                _finish_after_flush = bool(
+                    isinstance(raw, tuple)
+                    and len(raw) >= 2
+                    and raw[0] == "__activity_finish__"
+                )
+                _finish_requested = bool(ctx.progress_finish_header[0])
 
                 # Drain silently when interrupted: events queued in the
                 # window between tool parse and interrupt processing
@@ -4187,8 +4193,10 @@ class TurnRunner:
                 # last progress-flavored bubble the user should see.
                 try:
                     _agent_for_interrupt = ctx.agent_holder[0] if ctx.agent_holder else None
-                    if _agent_for_interrupt is not None and getattr(
-                        _agent_for_interrupt, "is_interrupted", False
+                    if (
+                        not _finish_after_flush
+                        and _agent_for_interrupt is not None
+                        and getattr(_agent_for_interrupt, "is_interrupted", False)
                     ):
                         # Drop this event and continue draining.
                         await asyncio.sleep(0)
@@ -4228,6 +4236,10 @@ class TurnRunner:
                     rolling_header = str(raw[1])
                     rolling_state_changed = True
                     msg = rolling_header
+                elif _finish_after_flush:
+                    rolling_header = str(raw[1])
+                    rolling_state_changed = True
+                    msg = rolling_header
                 else:
                     msg = raw
                     progress_lines.append(msg)
@@ -4245,7 +4257,7 @@ class TurnRunner:
                 # instead of reacting to 429s.)
                 _now = time.monotonic()
                 _remaining = _PROGRESS_EDIT_INTERVAL - (_now - _last_edit_ts)
-                if _remaining > 0:
+                if _remaining > 0 and not _finish_requested:
                     # Wait out the throttle interval, then loop back to
                     # drain any additional queued messages before sending
                     # a single batched edit.
@@ -4319,6 +4331,9 @@ class TurnRunner:
 
                 _last_edit_ts = time.monotonic()
 
+                if _finish_after_flush:
+                    return
+
                 # Restore typing indicator
                 await asyncio.sleep(0.3)
                 if ctx._run_still_current():
@@ -4359,7 +4374,11 @@ class TurnRunner:
                             ctx.repeat_count[0] = 0
                         elif isinstance(raw, tuple) and len(raw) >= 1 and raw[0] == "__activity_start__":
                             continue
-                        elif isinstance(raw, tuple) and len(raw) >= 2 and raw[0] == "__activity_state__":
+                        elif (
+                            isinstance(raw, tuple)
+                            and len(raw) >= 2
+                            and raw[0] in {"__activity_state__", "__activity_finish__"}
+                        ):
                             rolling_header = str(raw[1])
                             rolling_state_changed = True
                         else:
@@ -24986,6 +25005,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         agent_holder = [None]  # Mutable container for the agent instance
         turn_ctx.agent_holder = agent_holder
         result_holder = [None]  # Mutable container for the result
+        queued_followup_args = None
+        queued_parent_result = None
         tools_holder = [None]   # Mutable container for the tool definitions
         stream_consumer_holder = [None]  # Mutable container for stream consumer
         # #60671 — streaming PCM audio consumer.  Created on the gateway
@@ -26035,20 +26056,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # what the follow-up's guard will consult.  Fail-safe in helper.
                 await self._refresh_agent_cache_message_count(session_key, session_id)
 
-                followup_result = await self._run_agent(
-                    message=next_message,
-                    context_prompt=context_prompt,
-                    history=updated_history,
-                    source=next_source,
-                    session_id=session_id,
-                    session_key=next_session_key,
-                    run_generation=run_generation,
-                    _interrupt_depth=_interrupt_depth + 1,
-                    event_message_id=next_message_id,
-                    channel_prompt=next_channel_prompt,
-                    message_type=next_message_type,
-                )
-                return _preserve_queued_followup_history_offset(result, followup_result)
+                # Defer recursion until this turn's finally block has flushed
+                # its rolling terminal state and released its running slot.
+                # Awaiting the follow-up here leaves the first activity bubble
+                # at `⏳ Working…` while a second one is already active.
+                queued_parent_result = result
+                queued_followup_args = {
+                    "message": next_message,
+                    "context_prompt": context_prompt,
+                    "history": updated_history,
+                    "source": next_source,
+                    "session_id": session_id,
+                    "session_key": next_session_key,
+                    "run_generation": run_generation,
+                    "_interrupt_depth": _interrupt_depth + 1,
+                    "event_message_id": next_message_id,
+                    "channel_prompt": next_channel_prompt,
+                    "message_type": next_message_type,
+                }
         finally:
             # Stop progress sender, interrupt monitor, and notification task
             if progress_task:
@@ -26062,8 +26087,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _current_task and _current_task.cancelling()
                         ),
                     )
-                    progress_queue.put(("__activity_state__", _activity_header))
-                progress_task.cancel()
+                    # Graceful terminal flush: let the progress worker send or
+                    # edit the terminal header before it exits. Immediate tool
+                    # turns can otherwise cancel the worker between the initial
+                    # `⏳ Working…` send and the terminal edit, leaving a stale
+                    # activity message behind permanently.
+                    turn_ctx.progress_finish_header[0] = _activity_header
+                    progress_queue.put(("__activity_finish__", _activity_header))
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(progress_task), timeout=5.0
+                        )
+                    except (asyncio.TimeoutError, asyncio.CancelledError):
+                        progress_task.cancel()
+                        try:
+                            await progress_task
+                        except asyncio.CancelledError:
+                            pass
+                    except Exception as _progress_finish_err:
+                        logger.warning(
+                            "Rolling activity terminal flush failed: %s",
+                            _progress_finish_err,
+                        )
+                else:
+                    progress_task.cancel()
             if log_task:
                 log_task.cancel()
             interrupt_monitor.cancel()
@@ -26129,6 +26176,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         await task
                     except asyncio.CancelledError:
                         pass
+
+        if queued_followup_args is not None:
+            followup_result = await self._run_agent(**queued_followup_args)
+            return _preserve_queued_followup_history_offset(
+                queued_parent_result or {}, followup_result
+            )
 
         # If streaming already delivered the response, mark it so the
         # caller's send() is skipped (avoiding duplicate messages).
