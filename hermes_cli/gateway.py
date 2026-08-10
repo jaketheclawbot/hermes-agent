@@ -5516,6 +5516,17 @@ def generate_launchd_plist() -> str:
     <key>KeepAlive</key>
     <true/>
 
+    <!-- The macOS launchd default of 256 open file descriptors is too small
+         for a long-running multi-platform gateway with cron subprocesses,
+         network sockets, databases, and browser-control pipes. Raising the
+         ceiling does not preallocate descriptors; it only permits bounded
+         bursts that would otherwise fail with EMFILE. -->
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>1024</integer>
+    </dict>
+
     <!-- ThrottleInterval raises launchd's default 10s minimum respawn interval
          to 30s so a crash-looping gateway can't hammer launchd into a rapid
          respawn storm; ExitTimeOut gives the gateway 25s of graceful-drain

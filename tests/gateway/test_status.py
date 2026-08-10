@@ -1171,6 +1171,15 @@ class TestLaunchdPlistRespawnGovernance:
         assert "<key>ExitTimeOut</key>" in plist
         assert "<key>KeepAlive</key>" in plist
 
+    def test_plist_raises_gateway_open_file_soft_limit(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        from hermes_cli.gateway import generate_launchd_plist
+
+        plist = generate_launchd_plist()
+        assert "<key>SoftResourceLimits</key>" in plist
+        assert "<key>NumberOfFiles</key>" in plist
+        assert "<integer>1024</integer>" in plist
+
 
 class TestPermissionErrorOnLockFile:
     """Stale root-owned lock files from launchd Background sessions must not
