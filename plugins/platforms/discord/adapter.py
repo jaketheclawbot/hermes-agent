@@ -1455,7 +1455,10 @@ class DiscordAdapter(BasePlatformAdapter):
 
                 # Resolve any usernames in the allowed list to numeric IDs
                 await adapter_self._resolve_allowed_usernames()
-                await adapter_self._reconcile_multi_human_threads()
+                # Discord is live at this point.  Do not make readiness depend
+                # on scanning every active thread: large guilds can take longer
+                # than the runner's connect deadline, which cancels an already
+                # connected client and creates an endless reconnect loop.
                 adapter_self._ready_event.set()
 
                 if adapter_self._post_connect_task and not adapter_self._post_connect_task.done():
@@ -2479,6 +2482,7 @@ class DiscordAdapter(BasePlatformAdapter):
         if not self._client:
             return
         try:
+            await self._reconcile_multi_human_threads()
             sync_policy = self._get_discord_command_sync_policy()
             if sync_policy == "off":
                 logger.info("[%s] Skipping Discord slash command sync (policy=off)", self.name)

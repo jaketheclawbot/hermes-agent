@@ -141,6 +141,70 @@ class SlowSyncBot(FakeBot):
 
 
 @pytest.mark.asyncio
+async def test_connect_does_not_wait_for_thread_routing_reconciliation(monkeypatch):
+    """Discord is live once on_ready fires; thread scans must not consume the
+    gateway runner's 30-second connect budget.
+
+    A workspace with many active threads can make participant reconciliation
+    take longer than that budget.  Waiting for it before setting _ready_event
+    made every reconnect look successful in Discord and then get cancelled by
+    the runner, producing an endless online/offline loop.
+    """
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
+    monkeypatch.setattr(
+        "gateway.status.acquire_scoped_lock",
+        lambda scope, identity, metadata=None: (True, None),
+    )
+    monkeypatch.setattr("gateway.status.release_scoped_lock", lambda scope, identity: None)
+    intents = SimpleNamespace(
+        message_content=False, dm_messages=False, guild_messages=False,
+        members=False, voice_states=False,
+    )
+    monkeypatch.setattr(discord_platform.Intents, "default", lambda: intents)
+
+    class PersistentBot(FakeBot):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self._closed = asyncio.Event()
+
+        async def start(self, token):
+            if "on_ready" in self._events:
+                await self._events["on_ready"]()
+            await self._closed.wait()
+
+        def is_closed(self):
+            return self._closed.is_set()
+
+        async def close(self):
+            self._closed.set()
+
+    monkeypatch.setattr(discord_platform.commands, "Bot", PersistentBot)
+    monkeypatch.setattr(adapter, "_resolve_allowed_usernames", AsyncMock())
+
+    reconciliation_started = asyncio.Event()
+    allow_reconciliation_to_finish = asyncio.Event()
+
+    async def slow_reconciliation():
+        reconciliation_started.set()
+        await allow_reconciliation_to_finish.wait()
+
+    monkeypatch.setattr(adapter, "_reconcile_multi_human_threads", slow_reconciliation)
+
+    connect_task = asyncio.create_task(adapter.connect())
+    await asyncio.wait_for(adapter._ready_event.wait(), timeout=5.0)
+    await asyncio.sleep(0)
+    assert connect_task.done(), "connect() must return as soon as Discord is ready"
+    assert connect_task.result() is True
+    await asyncio.wait_for(reconciliation_started.wait(), timeout=5.0)
+    assert adapter._post_connect_task is not None
+    assert not adapter._post_connect_task.done()
+
+    allow_reconciliation_to_finish.set()
+    await asyncio.wait_for(adapter._post_connect_task, timeout=0.25)
+    await adapter.disconnect()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "initial_allowed",
     [
