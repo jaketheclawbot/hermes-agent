@@ -1821,8 +1821,11 @@ async def test_base_processing_stops_typing_before_hung_post_delivery_callback(
     adapter._active_sessions[session_key] = asyncio.Event()
     adapter._post_delivery_callbacks[session_key] = _post_delivery_cb
 
+    # Full updater validation runs this alongside hundreds of gateway tests on
+    # an older Intel Mac. One second is too tight under scheduler/GIL pressure
+    # and can fail even though the callback's own 10 ms deadline is working.
     await asyncio.wait_for(
-        adapter._process_message_background(event, session_key), timeout=1.0
+        adapter._process_message_background(event, session_key), timeout=10.0
     )
 
     assert [call["content"] for call in adapter.sent] == ["done"]
