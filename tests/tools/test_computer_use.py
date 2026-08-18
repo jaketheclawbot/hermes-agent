@@ -932,6 +932,96 @@ class TestContractAutoRepair:
                 cua_backend.CuaDriverBackend().start()
         installer.assert_not_called()
 
+    def test_configured_driver_pin_bypasses_newer_contract_without_repair(self, monkeypatch):
+        from unittest.mock import MagicMock, patch
+        from tools.computer_use import cua_backend
+
+        backend = cua_backend.CuaDriverBackend()
+        backend._session = MagicMock()
+        with patch.object(cua_backend, "_cua_driver_pin", return_value="0.7.1"), \
+             patch.object(
+                 cua_backend,
+                 "cua_driver_pinned_status",
+                 return_value={"ready": True, "version": "0.7.1"},
+             ), \
+             patch.object(cua_backend, "cua_driver_runtime_contract_status") as contract, \
+             patch("hermes_cli.tools_config.install_cua_driver") as installer, \
+             patch.object(cua_backend, "_maybe_nudge_update"), \
+             patch("tools.lazy_deps.ensure"):
+            backend.start()
+
+        contract.assert_not_called()
+        installer.assert_not_called()
+        backend._session.start.assert_called_once()
+
+    def test_configured_driver_pin_mismatch_fails_closed_without_repair(self):
+        from unittest.mock import patch
+        from tools.computer_use import cua_backend
+
+        with patch.object(cua_backend, "_cua_driver_pin", return_value="0.7.1"), \
+             patch.object(
+                 cua_backend,
+                 "cua_driver_pinned_status",
+                 return_value={
+                     "ready": False,
+                     "version": None,
+                     "reason": "configured cua-driver pin 0.7.1 is not installed",
+                 },
+             ), \
+             patch.object(cua_backend, "cua_driver_runtime_contract_status") as contract, \
+             patch("hermes_cli.tools_config.install_cua_driver") as installer, \
+             patch("tools.lazy_deps.ensure") as lazy_install:
+            with pytest.raises(RuntimeError, match="pin 0.7.1"):
+                cua_backend.CuaDriverBackend().start()
+
+        contract.assert_not_called()
+        installer.assert_not_called()
+        lazy_install.assert_not_called()
+
+    def test_pinned_status_accepts_only_the_exact_configured_version(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from tools.computer_use import cua_backend
+
+        with patch.object(cua_backend, "_cua_driver_pin", return_value="0.7.1"), \
+             patch.object(
+                 cua_backend, "resolve_cua_driver_cmd", return_value="/tmp/cua-driver"
+             ), \
+             patch.object(
+                 cua_backend.subprocess,
+                 "run",
+                 return_value=SimpleNamespace(
+                     returncode=0, stdout="cua-driver 0.7.1\n", stderr=""
+                 ),
+             ):
+            state = cua_backend.cua_driver_pinned_status()
+
+        assert state["ready"] is True
+        assert state["version"] == "0.7.1"
+        assert state["pinned"] is True
+
+    def test_pinned_status_rejects_a_different_installed_version(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from tools.computer_use import cua_backend
+
+        with patch.object(cua_backend, "_cua_driver_pin", return_value="0.7.1"), \
+             patch.object(
+                 cua_backend, "resolve_cua_driver_cmd", return_value="/tmp/cua-driver"
+             ), \
+             patch.object(
+                 cua_backend.subprocess,
+                 "run",
+                 return_value=SimpleNamespace(
+                     returncode=0, stdout="cua-driver 0.20.1\n", stderr=""
+                 ),
+             ):
+            state = cua_backend.cua_driver_pinned_status()
+
+        assert state["ready"] is False
+        assert state["version"] == "0.20.1"
+        assert "pin 0.7.1" in state["reason"]
+
 
 class TestCaptureAfterAppContext:
     """Bug 2: capture_after=True loses app context after actions.

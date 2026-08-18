@@ -231,6 +231,81 @@ def _computer_use_cfg() -> Dict[str, Any]:
         return {}
 
 
+def _cua_driver_pin() -> Optional[str]:
+    """Return the exact user-pinned cua-driver version, if configured.
+
+    A pin is an explicit compatibility contract. When present, Hermes must
+    never auto-repair or upgrade the driver behind the user's back.
+    """
+    raw = _computer_use_cfg().get("driver_version_pin")
+    if not isinstance(raw, str):
+        return None
+    value = raw.strip().lstrip("v")
+    return value if re.fullmatch(r"\d+\.\d+\.\d+", value) else None
+
+
+def cua_driver_pinned_status(binary: Optional[str] = None) -> Dict[str, Any]:
+    """Verify an exact configured driver pin without invoking an installer."""
+    pin = _cua_driver_pin()
+    resolved = binary or resolve_cua_driver_cmd()
+    if not pin:
+        return {
+            "ready": False,
+            "binary": resolved,
+            "version": None,
+            "reason": "no configured cua-driver pin",
+        }
+    if not resolved:
+        return {
+            "ready": False,
+            "binary": None,
+            "version": None,
+            "reason": f"configured cua-driver pin {pin} is not installed",
+        }
+    try:
+        from tools.environments.local import _sanitize_subprocess_env
+
+        result = subprocess.run(
+            [resolved, "--version"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5.0,
+            stdin=subprocess.DEVNULL,
+            env=_sanitize_subprocess_env(cua_driver_child_env()),
+            creationflags=windows_hide_flags(),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {
+            "ready": False,
+            "binary": resolved,
+            "version": None,
+            "reason": f"configured cua-driver pin {pin} could not be verified: {exc}",
+        }
+    output = (result.stdout or result.stderr or "").strip()
+    match = re.search(r"\b(\d+\.\d+\.\d+)(?:[-+][^\s]+)?\b", output)
+    version = match.group(1) if match else None
+    if result.returncode != 0 or version != pin:
+        detail = output.splitlines()[-1][:160] if output else "version probe failed"
+        return {
+            "ready": False,
+            "binary": resolved,
+            "version": version,
+            "reason": (
+                f"configured cua-driver pin {pin} is not installed "
+                f"(found {version or 'unknown'}: {detail})"
+            ),
+        }
+    return {
+        "ready": True,
+        "binary": resolved,
+        "version": version,
+        "reason": "",
+        "pinned": True,
+    }
+
+
 def _cua_no_overlay() -> bool:
     """True when Hermes should pass ``--no-overlay`` to cua-driver.
 
@@ -2704,15 +2779,28 @@ class CuaDriverBackend(ComputerUseBackend):
 
     # ── Lifecycle ──────────────────────────────────────────────────
     def start(self) -> None:
-        contract = cua_driver_runtime_contract_status()
-        if not contract.get("ready"):
-            # An installed-but-incompatible driver (e.g. predating a Hermes
-            # version-floor bump) is a state we created — repair it once
-            # automatically instead of failing every computer_use call.
-            contract = _maybe_repair_runtime_contract(contract)
+        pin = _cua_driver_pin()
+        if pin:
+            # A configured pin is authoritative. Verify that exact binary and
+            # never invoke the automatic repair/upgrade path behind the
+            # user's back. This keeps host-compatibility pins intact across
+            # normal Hermes updates.
+            contract = cua_driver_pinned_status()
+        else:
+            contract = cua_driver_runtime_contract_status()
+            if not contract.get("ready"):
+                # An installed-but-incompatible driver (e.g. predating a Hermes
+                # version-floor bump) is a state we created — repair it once
+                # automatically instead of failing every computer_use call.
+                contract = _maybe_repair_runtime_contract(contract)
         if not contract.get("ready"):
             reason = contract.get("reason") or "runtime contract is incomplete"
-            if os.environ.get(_CUA_DRIVER_CMD_ENV, "").strip():
+            if pin:
+                repair = (
+                    f"Install the configured pinned version {pin}; Hermes will "
+                    "not replace it automatically."
+                )
+            elif os.environ.get(_CUA_DRIVER_CMD_ENV, "").strip():
                 repair = (
                     "Update the binary selected by HERMES_CUA_DRIVER_CMD or "
                     "remove that override."
@@ -2720,7 +2808,8 @@ class CuaDriverBackend(ComputerUseBackend):
             else:
                 repair = "Run `hermes computer-use install` to repair it."
             raise RuntimeError(f"cua-driver is not ready: {reason}. {repair}")
-        _maybe_nudge_update()
+        if not pin:
+            _maybe_nudge_update()
         # The MCP client SDK (`mcp`) is an optional dependency (the
         # `computer-use` / `mcp` extras), not part of Hermes' minimal core.
         # Lazy-install it on first use — the same pattern every other optional

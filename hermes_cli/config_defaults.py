@@ -3902,6 +3902,10 @@ DEFAULT_CONFIG = {
         # every invocation (MCP backend, status, doctor, install). Set true
         # to let cua-driver use its own default (telemetry on).
         "cua_telemetry": False,
+        # Exact cua-driver version pin. When set, Computer Use verifies this
+        # version and never auto-repairs or upgrades it. Use for host OS
+        # compatibility when newer driver builds cannot run locally.
+        "driver_version_pin": "",
         "native_wayland": False,
         # Cap driver screenshot longest edge (pixels) via set_config on
         # session start. Shrinks SOM multimodal payloads; 0 disables.
