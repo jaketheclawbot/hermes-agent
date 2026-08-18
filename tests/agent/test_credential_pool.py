@@ -563,6 +563,51 @@ def test_dead_manual_entry_pruned_after_24h(tmp_path, monkeypatch):
 
 
 
+def test_manual_codex_account_never_adopts_singleton_tokens(tmp_path, monkeypatch):
+    """Independent Codex accounts must not collapse into the singleton account."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": "singleton-at",
+                        "refresh_token": "singleton-rt",
+                    },
+                    "last_refresh": "2026-08-18T00:00:00Z",
+                }
+            },
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "secondary",
+                        "label": "second-sub",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": "secondary-at",
+                        "refresh_token": "secondary-rt",
+                    }
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+    entry = pool.entries()[0]
+    result = pool._sync_codex_entry_from_auth_store(entry)
+
+    assert result is entry
+    persisted = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    secondary = persisted["credential_pool"]["openai-codex"][0]
+    assert secondary["access_token"] == "secondary-at"
+    assert secondary["refresh_token"] == "secondary-rt"
+
+
 def test_load_pool_seeds_env_api_key(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-seeded")

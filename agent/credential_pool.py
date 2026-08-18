@@ -1271,11 +1271,13 @@ class CredentialPool:
         though fresh credentials are sitting on disk — and every request
         fails with "no available entries (all exhausted or empty)".
 
-        Mirrors the Nous/Anthropic resync paths above.  Only applies to
-        device_code-sourced entries; env/API-key-sourced entries have no
-        auth.json shadow to sync from.
+        Mirrors the Nous/Anthropic resync paths above.  Only applies to the
+        singleton ``device_code`` entry.  ``manual:device_code`` entries are
+        independent accounts created by ``hermes auth add openai-codex`` and
+        must keep their own token pairs; adopting the singleton here silently
+        collapses a multi-account pool into one account.
         """
-        if self.provider != "openai-codex" or entry.source not in ("device_code", "manual:device_code"):
+        if self.provider != "openai-codex" or entry.source != "device_code":
             return entry
         try:
             with _auth_store_lock():
