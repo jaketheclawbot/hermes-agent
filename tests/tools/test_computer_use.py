@@ -1606,7 +1606,10 @@ class TestCaptureAppFilterNoMatch:
         assert backend._active_pid is None
         assert backend._active_window_id is None
 
-    def test_linux_default_capture_skips_gnome_shell_helper(self):
+    def test_linux_default_capture_skips_gnome_shell_helper(self, monkeypatch):
+        # Exercise the Linux-only selection branch even when the suite runs on
+        # the macOS deployment host.
+        monkeypatch.setattr(sys, "platform", "linux")
         windows = [
             {"app_name": "", "pid": 100, "window_id": 1,
              "is_on_screen": None, "title": "@!1921,0;BDHF", "z_index": 0},
