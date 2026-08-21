@@ -3863,6 +3863,42 @@ def _get_channel_override(
     return None
 
 
+def _get_channel_override_system_prompt(
+    config: GatewayConfig,
+    platform: Platform,
+    chat_id: str,
+    *,
+    thread_id: Optional[str] = None,
+    parent_id: Optional[str] = None,
+    ancestor_ids: Optional[Sequence[str]] = None,
+) -> str:
+    """Resolve the nearest non-empty prompt across channel ancestry.
+
+    Child overrides often select only a project workdir. They must not shadow
+    a category policy shared by sibling project channels. Model, provider, and
+    workdir selection remain exact-first through ``_get_channel_override``;
+    only prompt lookup cascades by field.
+    """
+    platforms = getattr(config, "platforms", None)
+    if not platforms:
+        return ""
+    platform_config = platforms.get(platform)
+    if not platform_config or not platform_config.channel_overrides:
+        return ""
+    overrides = platform_config.channel_overrides
+    for key in _channel_override_lookup_keys(
+        chat_id,
+        thread_id=thread_id,
+        parent_id=parent_id,
+        ancestor_ids=ancestor_ids,
+    ):
+        override = overrides.get(key)
+        prompt = (override.system_prompt or "").strip() if override else ""
+        if prompt:
+            return prompt
+    return ""
+
+
 def _resolve_hermes_bin() -> Optional[list[str]]:
     """Resolve the Hermes update command as argv parts.
 
@@ -9538,7 +9574,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         config = getattr(self, "config", None)
         if config:
-            override = _get_channel_override(
+            prompt = _get_channel_override_system_prompt(
                 config,
                 platform,
                 chat_id,
@@ -9546,8 +9582,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 parent_id=parent_id,
                 ancestor_ids=ancestor_ids,
             )
-            if override and override.system_prompt:
-                return (override.system_prompt or "").strip()
+            if prompt:
+                return prompt
         return getattr(self, "_ephemeral_system_prompt", None) or ""
 
     def _resolve_workdir_for_session(

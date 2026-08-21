@@ -105,6 +105,56 @@ class TestGetSystemPromptForChannel:
         prompt = runner._get_system_prompt_for_channel(Platform.DISCORD, "chan_1")
         assert prompt == "You are a coding assistant."
 
+    def test_child_workdir_override_inherits_category_system_prompt(self):
+        config = GatewayConfig(
+            platforms={
+                Platform.DISCORD: PlatformConfig(
+                    enabled=True,
+                    channel_overrides={
+                        "category": ChannelOverride(system_prompt="Shared company policy."),
+                        "channel": ChannelOverride(workdir="/tmp/project"),
+                    },
+                ),
+            },
+        )
+        runner = object.__new__(GatewayRunner)
+        runner.config = config
+        runner._ephemeral_system_prompt = "Global prompt"
+
+        prompt = runner._get_system_prompt_for_channel(
+            Platform.DISCORD,
+            "thread",
+            thread_id="thread",
+            parent_id="channel",
+            ancestor_ids=("channel", "category"),
+        )
+
+        assert prompt == "Shared company policy."
+
+    def test_nearest_explicit_prompt_still_wins(self):
+        config = GatewayConfig(
+            platforms={
+                Platform.DISCORD: PlatformConfig(
+                    enabled=True,
+                    channel_overrides={
+                        "category": ChannelOverride(system_prompt="Category policy."),
+                        "channel": ChannelOverride(system_prompt="Channel policy."),
+                    },
+                ),
+            },
+        )
+        runner = object.__new__(GatewayRunner)
+        runner.config = config
+
+        prompt = runner._get_system_prompt_for_channel(
+            Platform.DISCORD,
+            "thread",
+            parent_id="channel",
+            ancestor_ids=("channel", "category"),
+        )
+
+        assert prompt == "Channel policy."
+
 
 class TestResolveSessionAgentRuntimePriority:
     """Model/runtime priority: session /model → channel_overrides → global."""
