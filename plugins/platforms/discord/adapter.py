@@ -1661,10 +1661,7 @@ class DiscordAdapter(BasePlatformAdapter):
             is_dm = isinstance(message.channel, discord.DMChannel) or msg_guild is None
             msg_channel_ids = None
             if not is_dm:
-                msg_channel_ids = {str(message.channel.id)}
-                parent_id = self._get_parent_channel_id(message.channel)
-                if parent_id:
-                    msg_channel_ids.add(parent_id)
+                msg_channel_ids = self._discord_channel_scope_ids(message.channel)
             if not self._is_allowed_user(
                 str(message.author.id),
                 message.author,
@@ -5282,16 +5279,12 @@ class DiscordAdapter(BasePlatformAdapter):
             chan_id_raw = getattr(interaction, "channel_id", None) or getattr(
                 chan_obj, "id", None,
             )
-            if chan_id_raw is not None:
+            if chan_obj is not None:
+                channel_ids.update(self._discord_channel_scope_ids(chan_obj))
+            elif chan_id_raw is not None:
                 channel_ids.add(str(chan_id_raw))
-                # Mirror on_message: also test the parent channel for threads
-                # so per-channel allow/deny lists work consistently.
-                if isinstance(chan_obj, discord.Thread):
-                    parent_id = self._get_parent_channel_id(chan_obj)
-                    if parent_id:
-                        channel_ids.add(str(parent_id))
 
-            # Name-form keys (ID + bare name + #name + parent) so allow/ignore
+            # Name-form keys (ID + bare name + #name + ancestors) so allow/ignore
             # lists configured by channel name work for slash-command
             # interactions too, matching the on_message gates.
             channel_keys = self._discord_channel_keys_from_channel(
@@ -6979,6 +6972,10 @@ class DiscordAdapter(BasePlatformAdapter):
             keys.add(channel_name)
             keys.add(f"#{channel_name}")
 
+        keys.update(self._channel_ancestor_ids(channel))
+
+        # Preserve cold-cache/partial-fixture parity: an immediate parent_id
+        # remains a valid gate key even when the object cannot be resolved.
         parent_id = parent_channel_id or getattr(channel, "parent_id", None)
         if parent_id:
             keys.add(str(parent_id))
@@ -8217,6 +8214,22 @@ class DiscordAdapter(BasePlatformAdapter):
                 ids.append(parent_id)
             current = parent
         return tuple(ids)
+
+    def _discord_channel_scope_ids(self, channel: Any) -> set[str]:
+        """Return current, parent, and category IDs for Discord auth gates.
+
+        This lets one category ID authorize its current and future child
+        channels/threads while preserving fail-closed exact-snowflake scope.
+        """
+        ids = set(self._channel_ancestor_ids(channel))
+        channel_id = getattr(channel, "id", None)
+        if channel_id is not None:
+            ids.add(str(channel_id))
+        # Partial interactions/cold caches may expose only ``parent_id``.
+        parent_id = getattr(channel, "parent_id", None)
+        if parent_id is not None:
+            ids.add(str(parent_id))
+        return ids
 
     def _is_forum_parent(self, channel: Any) -> bool:
         """Best-effort check for whether a Discord channel is a forum channel."""
