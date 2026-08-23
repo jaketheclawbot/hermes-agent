@@ -130,7 +130,7 @@ _SENTINEL = object()
 
 def _make_interaction(
     user_id, *, channel_id=12345, guild_id=42, in_dm=False, in_thread=False,
-    parent_channel_id=None, user=_SENTINEL, channel_name=None,
+    parent_channel_id=None, category_id=None, user=_SENTINEL, channel_name=None,
 ):
     """Build a mock Discord Interaction with a still-unresponded response.
 
@@ -150,6 +150,13 @@ def _make_interaction(
         channel = discord.Thread()
         channel.id = channel_id
         channel.parent_id = parent_channel_id
+        if category_id is not None:
+            category = SimpleNamespace(id=category_id, name="company-category", parent=None)
+            channel.parent = SimpleNamespace(
+                id=parent_channel_id,
+                name="company-channel",
+                parent=category,
+            )
         if channel_name is not None:
             channel.name = channel_name
     elif channel_id is None:
@@ -363,6 +370,32 @@ async def test_thread_parent_in_allowlist_passes(adapter, monkeypatch):
         "100200300", channel_id=9999, in_thread=True, parent_channel_id=5555,
     )
     assert await adapter._check_slash_authorization(interaction, "/help") is True
+
+
+@pytest.mark.asyncio
+async def test_thread_category_in_allowlist_passes(adapter, monkeypatch):
+    """A category allowlist covers current and future child-channel threads."""
+    monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", "7777")
+    interaction = _make_interaction(
+        "100200300",
+        channel_id=9999,
+        in_thread=True,
+        parent_channel_id=5555,
+        category_id=7777,
+    )
+    assert await adapter._check_slash_authorization(interaction, "/help") is True
+
+
+def test_thread_category_is_in_message_gate_keys_and_scope_ids(adapter):
+    """Normal message ingress sees the same category ancestor as slash auth."""
+    category = SimpleNamespace(id=7777, name="company-category", parent=None)
+    parent = SimpleNamespace(id=5555, name="company-channel", parent=category)
+    thread = SimpleNamespace(id=9999, name="task-thread", parent_id=5555, parent=parent)
+    message = SimpleNamespace(channel=thread)
+
+    assert adapter._discord_channel_scope_ids(thread) == {"9999", "5555", "7777"}
+    keys = adapter._discord_channel_keys(message, "5555")
+    assert {"9999", "5555", "7777", "task-thread", "company-channel"} <= keys
 
 
 @pytest.mark.asyncio
