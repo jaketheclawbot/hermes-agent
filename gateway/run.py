@@ -5456,7 +5456,7 @@ class TurnRunner:
             return
 
         progress_lines = []      # Complete tool entries in the CURRENT editable bubble
-        progress_msg_id = None   # ID of the current progress message to edit
+        progress_msg_id = ctx.initial_progress_msg_id  # May be seeded by preflight compression.
         can_edit = ctx.progress_grouping != "separate"  # "separate" = one message per tool (pre-v0.9 behavior)
         rolling_omitted_count = 0
         rolling_header = "⏳ Working…" if ctx.progress_grouping == "rolling" else None
@@ -21872,6 +21872,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # began processing if the gateway died while it was still waiting.
         await self._mark_durable_active_turn(event, session_entry.session_key)
 
+        _hyg_progress_message_id = None
         # Load conversation history from transcript. An unreadable canonical
         # store is not an empty conversation: stop before the agent can invent
         # continuity from a plausible-looking []. This return happens before
@@ -22177,6 +22178,48 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
 
                     _hyg_meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
+
+                    # Rolling activity owns one editable bubble for the whole
+                    # turn. Seed it before the potentially minutes-long hygiene
+                    # pass, then hand its ID to the normal progress sender.
+                    try:
+                        from gateway.display_config import resolve_display_setting
+
+                        _hyg_platform_key = _platform_config_key(source.platform)
+                        _hyg_progress_mode = resolve_display_setting(
+                            _hyg_data, _hyg_platform_key, "tool_progress", "all"
+                        )
+                        _hyg_progress_grouping = resolve_display_setting(
+                            _hyg_data,
+                            _hyg_platform_key,
+                            "tool_progress_grouping",
+                            "accumulate",
+                        )
+                        _hyg_adapter = self._adapter_for_source(source)
+                        _hyg_edit = (
+                            getattr(type(_hyg_adapter), "edit_message", None)
+                            if _hyg_adapter is not None
+                            else None
+                        )
+                        if (
+                            _hyg_progress_grouping == "rolling"
+                            and _hyg_progress_mode not in {"off", "log"}
+                            and not self._get_proxy_url()
+                            and _hyg_edit is not None
+                            and _hyg_edit is not BasePlatformAdapter.edit_message
+                        ):
+                            _hyg_send = await _hyg_adapter.send(
+                                source.chat_id,
+                                "⏳ Compressing conversation context…",
+                                metadata=_hyg_meta,
+                            )
+                            if _hyg_send.success and _hyg_send.message_id:
+                                _hyg_progress_message_id = str(_hyg_send.message_id)
+                    except Exception:
+                        logger.debug(
+                            "Session hygiene progress notice failed",
+                            exc_info=True,
+                        )
 
                     try:
                         from agent.conversation_compression import CompressionCommitFence
@@ -23240,6 +23283,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "Session hygiene auto-compress failed: %s", e
                         )
 
+                    if (
+                        _hyg_progress_message_id
+                        and self._is_session_run_current(_quick_key, run_generation)
+                    ):
+                        try:
+                            await _hyg_adapter.edit_message(
+                                source.chat_id,
+                                _hyg_progress_message_id,
+                                "⏳ Working…",
+                                metadata=_hyg_meta,
+                            )
+                        except Exception:
+                            logger.debug(
+                                "Session hygiene progress edit failed",
+                                exc_info=True,
+                            )
+
         # First-message onboarding -- only on the very first interaction ever.
         # Delivered on the current user message (sidecar), NOT the ephemeral
         # system prompt: present-on-turn-1/absent-on-turn-2 was a guaranteed
@@ -23458,6 +23518,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
+                progress_message_id=_hyg_progress_message_id,
                 message_type=event.message_type,
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
@@ -31417,6 +31478,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
+        progress_message_id: Optional[str] = None,
         message_type: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
@@ -31438,6 +31500,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
+                progress_message_id=progress_message_id,
                 message_type=message_type,
             )
 
@@ -31452,6 +31515,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
+                progress_message_id=progress_message_id,
                 message_type=message_type,
             )
 
@@ -31596,6 +31660,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
+        progress_message_id: Optional[str] = None,
         message_type: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
@@ -31858,6 +31923,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _cleanup_progress = False
             _cleanup_adapter = None
         _cleanup_msg_ids: List[str] = []
+        if _cleanup_progress and progress_message_id:
+            _cleanup_msg_ids.append(progress_message_id)
         # First-touch onboarding latch: fires at most once per run, even if
         # several tools exceed the threshold.
         long_tool_hint_fired = [False]
@@ -31882,6 +31949,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _LONG_TOOL_THRESHOLD_S=_LONG_TOOL_THRESHOLD_S,
             _cleanup_progress=_cleanup_progress,
             _cleanup_msg_ids=_cleanup_msg_ids,
+            initial_progress_msg_id=progress_message_id,
             message=message,
             AIAgent=AIAgent,
             resolve_display_setting=resolve_display_setting,

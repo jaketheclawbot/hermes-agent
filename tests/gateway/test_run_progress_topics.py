@@ -1093,6 +1093,7 @@ async def _run_with_agent(
     adapter_cls=ProgressCaptureAdapter,
     user_id=None,
     scope_id=None,
+    progress_message_id=None,
 ):
     if config_data:
         import yaml
@@ -1140,6 +1141,7 @@ async def _run_with_agent(
         source=source,
         session_id=session_id,
         session_key=session_key,
+        progress_message_id=progress_message_id,
     )
     return adapter, result
 
@@ -1284,6 +1286,31 @@ async def test_rolling_progress_keeps_one_bounded_editable_tail(monkeypatch, tmp
     assert "first-short" not in final_progress
     assert adapter.oversized_sends == []
     assert adapter.oversized_edits == []
+
+
+@pytest.mark.asyncio
+async def test_rolling_progress_reuses_preflight_compression_message(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        ManyProgressLinesAgent,
+        session_id="sess-progress-rolling-preflight",
+        progress_message_id="preflight-1",
+        config_data={
+            "display": {
+                "tool_progress": "all",
+                "tool_progress_grouping": "rolling",
+                "interim_assistant_messages": False,
+            }
+        },
+        platform=Platform.DISCORD,
+        adapter_cls=Utf16SmallLimitProgressAdapter,
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.sent == []
+    assert adapter.edits
+    assert {call["message_id"] for call in adapter.edits} == {"preflight-1"}
 
 
 @pytest.mark.asyncio
