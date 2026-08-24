@@ -27,6 +27,7 @@ actionable guidance the model can relay to the user.
 
 import json
 import logging
+import os
 import threading
 import urllib.error
 import urllib.parse
@@ -62,6 +63,55 @@ class DiscordAPIError(Exception):
         self.status = status
         self.body = body
         super().__init__(f"Discord API error {status}: {body}")
+
+
+class DiscordScopeError(Exception):
+    """Raised when a Discord REST action escapes its configured channel scope."""
+
+
+def _tool_respects_channel_allowlist() -> bool:
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+        return bool((cfg.get("discord") or {}).get("tool_respect_channel_allowlist", False))
+    except Exception:
+        logger.debug("Could not load Discord tool scope config", exc_info=True)
+        return False
+
+
+def _configured_allowed_channel_ids() -> set[str]:
+    raw = os.environ.get("DISCORD_ALLOWED_CHANNELS", "")
+    return {item.strip() for item in raw.split(",") if item.strip()}
+
+
+def _channel_scope_ids(token: str, channel: Dict[str, Any]) -> set[str]:
+    """Return channel, parent, and category IDs for a REST channel object."""
+    ids = {str(channel.get("id"))} if channel.get("id") is not None else set()
+    parent_id = channel.get("parent_id")
+    if parent_id is not None:
+        ids.add(str(parent_id))
+        parent = _discord_request("GET", f"/channels/{parent_id}", token)
+        if parent.get("id") is not None:
+            ids.add(str(parent["id"]))
+        if parent.get("parent_id") is not None:
+            ids.add(str(parent["parent_id"]))
+    return ids
+
+
+def _assert_channel_in_tool_scope(token: str, channel_id: str) -> Dict[str, Any]:
+    """Fail closed unless a channel descends from an allowed channel/category."""
+    channel = _discord_request("GET", f"/channels/{channel_id}", token)
+    allowed = _configured_allowed_channel_ids()
+    if not allowed:
+        raise DiscordScopeError(
+            "Discord history scope is enabled but DISCORD_ALLOWED_CHANNELS is empty."
+        )
+    if not (_channel_scope_ids(token, channel) & allowed):
+        raise DiscordScopeError(
+            f"Channel {channel_id} is outside the configured Discord history scope."
+        )
+    return channel
 
 
 def _read_limited_response_body(source: Any, limit: int, *, label: str) -> bytes:
@@ -379,8 +429,33 @@ def _server_info(token: str, guild_id: str, **_kwargs: Any) -> str:
 
 
 def _list_channels(token: str, guild_id: str, **_kwargs: Any) -> str:
-    """List all channels in a guild, organized by category."""
+    """List channels in a guild, optionally filtered to the configured scope."""
     channels = _discord_request("GET", f"/guilds/{guild_id}/channels", token)
+    if _tool_respects_channel_allowlist():
+        allowed = _configured_allowed_channel_ids()
+        if not allowed:
+            raise DiscordScopeError(
+                "Discord history scope is enabled but DISCORD_ALLOWED_CHANNELS is empty."
+            )
+        admitted_non_categories = [
+            ch for ch in channels
+            if ch.get("type") != 4
+            and ({str(ch.get("id")), str(ch.get("parent_id"))} & allowed)
+        ]
+        required_categories = {
+            str(ch.get("parent_id")) for ch in admitted_non_categories
+            if ch.get("parent_id") is not None
+        }
+        channels = [
+            ch for ch in channels
+            if (
+                ch in admitted_non_categories
+                or (
+                    ch.get("type") == 4
+                    and (str(ch.get("id")) in allowed or str(ch.get("id")) in required_categories)
+                )
+            )
+        ]
 
     # Organize: categories first, then channels under each
     categories: Dict[Optional[str], Dict[str, Any]] = {}
@@ -550,6 +625,62 @@ def _fetch_messages(
     return json.dumps({"messages": result, "count": len(result)})
 
 
+def _list_threads(
+    token: str, channel_id: str, limit: int = 50,
+    before: Optional[str] = None, **_kwargs: Any,
+) -> str:
+    """List active and archived public threads under one parent channel."""
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = 50
+    limit = min(max(limit, 1), 100)
+
+    parent = _discord_request("GET", f"/channels/{channel_id}", token)
+    guild_id = parent.get("guild_id")
+    if not guild_id:
+        raise DiscordAPIError(400, f"Channel {channel_id} has no guild_id.")
+
+    active_payload = _discord_request("GET", f"/guilds/{guild_id}/threads/active", token)
+    active = [
+        thread for thread in active_payload.get("threads", [])
+        if str(thread.get("parent_id")) == str(channel_id)
+    ]
+
+    params = {"limit": str(limit)}
+    if before:
+        params["before"] = before
+    archived_payload = _discord_request(
+        "GET", f"/channels/{channel_id}/threads/archived/public", token, params=params,
+    )
+    archived = archived_payload.get("threads", [])
+
+    result = []
+    seen = set()
+    for thread in [*active, *archived]:
+        thread_id = str(thread.get("id"))
+        if not thread_id or thread_id in seen:
+            continue
+        seen.add(thread_id)
+        metadata = thread.get("thread_metadata") or {}
+        result.append({
+            "id": thread_id,
+            "name": thread.get("name"),
+            "parent_id": thread.get("parent_id"),
+            "type": _channel_type_name(thread.get("type")),
+            "archived": metadata.get("archived", False),
+            "archive_timestamp": metadata.get("archive_timestamp"),
+            "locked": metadata.get("locked", False),
+            "message_count": thread.get("message_count"),
+            "last_message_id": thread.get("last_message_id"),
+        })
+    return json.dumps({
+        "threads": result,
+        "count": len(result),
+        "archived_has_more": bool(archived_payload.get("has_more", False)),
+    })
+
+
 def _list_pins(token: str, channel_id: str, **_kwargs: Any) -> str:
     """List pinned messages in a channel."""
     messages = _discord_request("GET", f"/channels/{channel_id}/pins", token)
@@ -638,6 +769,7 @@ _ACTIONS = {
     "member_info": _member_info,
     "search_members": _search_members,
     "fetch_messages": _fetch_messages,
+    "list_threads": _list_threads,
     "list_pins": _list_pins,
     "pin_message": _pin_message,
     "unpin_message": _unpin_message,
@@ -647,7 +779,7 @@ _ACTIONS = {
     "remove_role": _remove_role,
 }
 
-_CORE_ACTION_NAMES = frozenset({"fetch_messages", "search_members", "create_thread"})
+_CORE_ACTION_NAMES = frozenset({"fetch_messages", "list_threads", "search_members", "create_thread"})
 _ADMIN_ACTION_NAMES = frozenset(_ACTIONS.keys()) - _CORE_ACTION_NAMES
 
 _CORE_ACTIONS = {k: v for k, v in _ACTIONS.items() if k in _CORE_ACTION_NAMES}
@@ -665,6 +797,7 @@ _ACTION_MANIFEST: List[Tuple[str, str, str]] = [
     ("member_info", "(guild_id, user_id)", "lookup a specific member"),
     ("search_members", "(guild_id, query)", "find members by name prefix"),
     ("fetch_messages", "(channel_id)", "recent messages; optional before/after snowflakes"),
+    ("list_threads", "(channel_id)", "active and archived public threads under a parent channel"),
     ("list_pins", "(channel_id)", "pinned messages in a channel"),
     ("pin_message", "(channel_id, message_id)", "pin a message"),
     ("unpin_message", "(channel_id, message_id)", "unpin a message"),
@@ -686,6 +819,7 @@ _REQUIRED_PARAMS: Dict[str, List[str]] = {
     "search_members": ["guild_id", "query"],
     "channel_info": ["channel_id"],
     "fetch_messages": ["channel_id"],
+    "list_threads": ["channel_id"],
     "list_pins": ["channel_id"],
     "pin_message": ["channel_id", "message_id"],
     "unpin_message": ["channel_id", "message_id"],
@@ -856,11 +990,11 @@ def _build_schema(
             "type": "integer",
             "minimum": 1,
             "maximum": 100,
-            "description": "Max results (default 50). Applies to fetch_messages, search_members.",
+            "description": "Max results (default 50). Applies to fetch_messages, list_threads, search_members.",
         },
         "before": {
             "type": "string",
-            "description": "Snowflake ID for reverse pagination (fetch_messages).",
+            "description": "Snowflake ID for fetch_messages; ISO8601 archive timestamp for list_threads.",
         },
         "after": {
             "type": "string",
@@ -1038,6 +1172,8 @@ def _run_discord_action(
         )
 
     try:
+        if channel_id and _tool_respects_channel_allowlist():
+            _assert_channel_in_tool_scope(token, channel_id)
         return action_fn(
             token=token,
             guild_id=guild_id,
@@ -1052,6 +1188,9 @@ def _run_discord_action(
             after=after,
             auto_archive_duration=auto_archive_duration,
         )
+    except DiscordScopeError as e:
+        logger.warning("Discord scope denial in %s action '%s': %s", tool_label, action, e)
+        return tool_error(str(e))
     except DiscordAPIError as e:
         logger.warning("Discord API error in %s action '%s': %s", tool_label, action, e)
         if e.status == 403:
@@ -1063,7 +1202,7 @@ def _run_discord_action(
 
 
 def discord_core(action: str, **kwargs) -> str:
-    """Execute a core Discord action (fetch_messages, search_members, create_thread)."""
+    """Execute a core Discord action (history, members, thread creation)."""
     return _run_discord_action(action, _CORE_ACTIONS, "discord", **kwargs)
 
 
