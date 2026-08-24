@@ -277,6 +277,46 @@ class TestFetchMessages:
 
 class TestScopedHistory:
     @patch("tools.discord_tool._discord_request")
+    def test_guild_scope_allows_any_channel_in_configured_guild(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        monkeypatch.setattr("tools.discord_tool._tool_respects_channel_allowlist", lambda: False)
+        monkeypatch.setattr("tools.discord_tool._configured_tool_guild_ids", lambda: {"1"})
+
+        def response(method, path, token, **kwargs):
+            if path == "/channels/90":
+                return {"id": "90", "type": 0, "parent_id": "80", "guild_id": "1"}
+            if path == "/channels/90/messages":
+                return [{
+                    "id": "1002", "content": "cross-company context",
+                    "author": {"id": "42", "username": "user"},
+                    "timestamp": "2026-01-01T00:00:00Z", "attachments": [],
+                    "pinned": False,
+                }]
+            raise AssertionError(path)
+
+        mock_req.side_effect = response
+        result = json.loads(discord_core(action="fetch_messages", channel_id="90"))
+        assert result["messages"][0]["content"] == "cross-company context"
+
+    @patch("tools.discord_tool._discord_request")
+    def test_guild_scope_rejects_channel_in_other_guild(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        monkeypatch.setattr("tools.discord_tool._tool_respects_channel_allowlist", lambda: False)
+        monkeypatch.setattr("tools.discord_tool._configured_tool_guild_ids", lambda: {"1"})
+        mock_req.return_value = {"id": "91", "type": 0, "guild_id": "2"}
+        result = json.loads(discord_core(action="fetch_messages", channel_id="91"))
+        assert "outside the configured Discord history guild scope" in result["error"]
+        mock_req.assert_called_once_with("GET", "/channels/91", "test-token")
+
+    @patch("tools.discord_tool._discord_request")
+    def test_list_channels_rejects_other_guild_before_api_read(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        monkeypatch.setattr("tools.discord_tool._configured_tool_guild_ids", lambda: {"1"})
+        result = json.loads(discord_admin_handler(action="list_channels", guild_id="2"))
+        assert "outside the configured Discord history guild scope" in result["error"]
+        mock_req.assert_not_called()
+
+    @patch("tools.discord_tool._discord_request")
     def test_thread_history_allowed_via_category_ancestor(self, mock_req, monkeypatch):
         monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
         monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", "10")

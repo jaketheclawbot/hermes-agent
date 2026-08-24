@@ -85,6 +85,22 @@ def _configured_allowed_channel_ids() -> set[str]:
     return {item.strip() for item in raw.split(",") if item.strip()}
 
 
+def _configured_tool_guild_ids() -> set[str]:
+    """Return the config-only guild scope for on-demand Discord tools."""
+    try:
+        from hermes_cli.config import load_config
+
+        raw = (load_config().get("discord") or {}).get("tool_allowed_guilds", [])
+    except Exception:
+        logger.debug("Could not load Discord tool guild scope", exc_info=True)
+        return set()
+    if isinstance(raw, str):
+        return {item.strip() for item in raw.split(",") if item.strip()}
+    if isinstance(raw, (list, tuple, set)):
+        return {str(item).strip() for item in raw if str(item).strip()}
+    return set()
+
+
 def _channel_scope_ids(token: str, channel: Dict[str, Any]) -> set[str]:
     """Return channel, parent, and category IDs for a REST channel object."""
     ids = {str(channel.get("id"))} if channel.get("id") is not None else set()
@@ -102,6 +118,13 @@ def _channel_scope_ids(token: str, channel: Dict[str, Any]) -> set[str]:
 def _assert_channel_in_tool_scope(token: str, channel_id: str) -> Dict[str, Any]:
     """Fail closed unless a channel descends from an allowed channel/category."""
     channel = _discord_request("GET", f"/channels/{channel_id}", token)
+    allowed_guilds = _configured_tool_guild_ids()
+    if allowed_guilds and str(channel.get("guild_id")) not in allowed_guilds:
+        raise DiscordScopeError(
+            f"Channel {channel_id} is outside the configured Discord history guild scope."
+        )
+    if not _tool_respects_channel_allowlist():
+        return channel
     allowed = _configured_allowed_channel_ids()
     if not allowed:
         raise DiscordScopeError(
@@ -430,6 +453,11 @@ def _server_info(token: str, guild_id: str, **_kwargs: Any) -> str:
 
 def _list_channels(token: str, guild_id: str, **_kwargs: Any) -> str:
     """List channels in a guild, optionally filtered to the configured scope."""
+    allowed_guilds = _configured_tool_guild_ids()
+    if allowed_guilds and str(guild_id) not in allowed_guilds:
+        raise DiscordScopeError(
+            f"Guild {guild_id} is outside the configured Discord history guild scope."
+        )
     channels = _discord_request("GET", f"/guilds/{guild_id}/channels", token)
     if _tool_respects_channel_allowlist():
         allowed = _configured_allowed_channel_ids()
@@ -1172,7 +1200,9 @@ def _run_discord_action(
         )
 
     try:
-        if channel_id and _tool_respects_channel_allowlist():
+        if channel_id and (
+            _tool_respects_channel_allowlist() or _configured_tool_guild_ids()
+        ):
             _assert_channel_in_tool_scope(token, channel_id)
         return action_fn(
             token=token,
