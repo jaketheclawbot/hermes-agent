@@ -27,7 +27,6 @@ actionable guidance the model can relay to the user.
 
 import json
 import logging
-import os
 import threading
 import urllib.error
 import urllib.parse
@@ -69,22 +68,6 @@ class DiscordScopeError(Exception):
     """Raised when a Discord REST action escapes its configured channel scope."""
 
 
-def _tool_respects_channel_allowlist() -> bool:
-    try:
-        from hermes_cli.config import load_config
-
-        cfg = load_config()
-        return bool((cfg.get("discord") or {}).get("tool_respect_channel_allowlist", False))
-    except Exception:
-        logger.debug("Could not load Discord tool scope config", exc_info=True)
-        return False
-
-
-def _configured_allowed_channel_ids() -> set[str]:
-    raw = os.environ.get("DISCORD_ALLOWED_CHANNELS", "")
-    return {item.strip() for item in raw.split(",") if item.strip()}
-
-
 def _configured_tool_guild_ids() -> set[str]:
     """Return the config-only guild scope for on-demand Discord tools."""
     try:
@@ -101,38 +84,15 @@ def _configured_tool_guild_ids() -> set[str]:
     return set()
 
 
-def _channel_scope_ids(token: str, channel: Dict[str, Any]) -> set[str]:
-    """Return channel, parent, and category IDs for a REST channel object."""
-    ids = {str(channel.get("id"))} if channel.get("id") is not None else set()
-    parent_id = channel.get("parent_id")
-    if parent_id is not None:
-        ids.add(str(parent_id))
-        parent = _discord_request("GET", f"/channels/{parent_id}", token)
-        if parent.get("id") is not None:
-            ids.add(str(parent["id"]))
-        if parent.get("parent_id") is not None:
-            ids.add(str(parent["parent_id"]))
-    return ids
-
-
 def _assert_channel_in_tool_scope(token: str, channel_id: str) -> Dict[str, Any]:
-    """Fail closed unless a channel descends from an allowed channel/category."""
+    """Fail closed unless a channel belongs to an allowed guild."""
     channel = _discord_request("GET", f"/channels/{channel_id}", token)
     allowed_guilds = _configured_tool_guild_ids()
-    if allowed_guilds and str(channel.get("guild_id")) not in allowed_guilds:
+    if not allowed_guilds:
+        return channel
+    if str(channel.get("guild_id")) not in allowed_guilds:
         raise DiscordScopeError(
             f"Channel {channel_id} is outside the configured Discord history guild scope."
-        )
-    if not _tool_respects_channel_allowlist():
-        return channel
-    allowed = _configured_allowed_channel_ids()
-    if not allowed:
-        raise DiscordScopeError(
-            "Discord history scope is enabled but DISCORD_ALLOWED_CHANNELS is empty."
-        )
-    if not (_channel_scope_ids(token, channel) & allowed):
-        raise DiscordScopeError(
-            f"Channel {channel_id} is outside the configured Discord history scope."
         )
     return channel
 
@@ -452,38 +412,13 @@ def _server_info(token: str, guild_id: str, **_kwargs: Any) -> str:
 
 
 def _list_channels(token: str, guild_id: str, **_kwargs: Any) -> str:
-    """List channels in a guild, optionally filtered to the configured scope."""
+    """List channels in a configured guild."""
     allowed_guilds = _configured_tool_guild_ids()
     if allowed_guilds and str(guild_id) not in allowed_guilds:
         raise DiscordScopeError(
             f"Guild {guild_id} is outside the configured Discord history guild scope."
         )
     channels = _discord_request("GET", f"/guilds/{guild_id}/channels", token)
-    if _tool_respects_channel_allowlist():
-        allowed = _configured_allowed_channel_ids()
-        if not allowed:
-            raise DiscordScopeError(
-                "Discord history scope is enabled but DISCORD_ALLOWED_CHANNELS is empty."
-            )
-        admitted_non_categories = [
-            ch for ch in channels
-            if ch.get("type") != 4
-            and ({str(ch.get("id")), str(ch.get("parent_id"))} & allowed)
-        ]
-        required_categories = {
-            str(ch.get("parent_id")) for ch in admitted_non_categories
-            if ch.get("parent_id") is not None
-        }
-        channels = [
-            ch for ch in channels
-            if (
-                ch in admitted_non_categories
-                or (
-                    ch.get("type") == 4
-                    and (str(ch.get("id")) in allowed or str(ch.get("id")) in required_categories)
-                )
-            )
-        ]
 
     # Organize: categories first, then channels under each
     categories: Dict[Optional[str], Dict[str, Any]] = {}
@@ -1200,9 +1135,7 @@ def _run_discord_action(
         )
 
     try:
-        if channel_id and (
-            _tool_respects_channel_allowlist() or _configured_tool_guild_ids()
-        ):
+        if channel_id and _configured_tool_guild_ids():
             _assert_channel_in_tool_scope(token, channel_id)
         return action_fn(
             token=token,

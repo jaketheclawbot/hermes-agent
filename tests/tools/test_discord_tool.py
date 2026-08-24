@@ -279,7 +279,6 @@ class TestScopedHistory:
     @patch("tools.discord_tool._discord_request")
     def test_guild_scope_allows_any_channel_in_configured_guild(self, mock_req, monkeypatch):
         monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
-        monkeypatch.setattr("tools.discord_tool._tool_respects_channel_allowlist", lambda: False)
         monkeypatch.setattr("tools.discord_tool._configured_tool_guild_ids", lambda: {"1"})
 
         def response(method, path, token, **kwargs):
@@ -301,7 +300,6 @@ class TestScopedHistory:
     @patch("tools.discord_tool._discord_request")
     def test_guild_scope_rejects_channel_in_other_guild(self, mock_req, monkeypatch):
         monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
-        monkeypatch.setattr("tools.discord_tool._tool_respects_channel_allowlist", lambda: False)
         monkeypatch.setattr("tools.discord_tool._configured_tool_guild_ids", lambda: {"1"})
         mock_req.return_value = {"id": "91", "type": 0, "guild_id": "2"}
         result = json.loads(discord_core(action="fetch_messages", channel_id="91"))
@@ -317,66 +315,9 @@ class TestScopedHistory:
         mock_req.assert_not_called()
 
     @patch("tools.discord_tool._discord_request")
-    def test_thread_history_allowed_via_category_ancestor(self, mock_req, monkeypatch):
-        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
-        monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", "10")
-        monkeypatch.setattr("tools.discord_tool._tool_respects_channel_allowlist", lambda: True)
-
-        def response(method, path, token, **kwargs):
-            if path == "/channels/30":
-                return {"id": "30", "type": 11, "parent_id": "20", "guild_id": "1"}
-            if path == "/channels/20":
-                return {"id": "20", "type": 0, "parent_id": "10", "guild_id": "1"}
-            if path == "/channels/30/messages":
-                return [{
-                    "id": "1001", "content": "company history",
-                    "author": {"id": "42", "username": "user"},
-                    "timestamp": "2026-01-01T00:00:00Z", "attachments": [],
-                    "pinned": False,
-                }]
-            raise AssertionError(path)
-
-        mock_req.side_effect = response
-        result = json.loads(discord_core(action="fetch_messages", channel_id="30"))
-        assert result["messages"][0]["content"] == "company history"
-
-    @patch("tools.discord_tool._discord_request")
-    def test_history_outside_category_fails_closed(self, mock_req, monkeypatch):
-        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
-        monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", "10")
-        monkeypatch.setattr("tools.discord_tool._tool_respects_channel_allowlist", lambda: True)
-
-        def response(method, path, token, **kwargs):
-            if path == "/channels/31":
-                return {"id": "31", "type": 11, "parent_id": "21", "guild_id": "1"}
-            if path == "/channels/21":
-                return {"id": "21", "type": 0, "parent_id": "11", "guild_id": "1"}
-            raise AssertionError("message history must not be requested after a scope denial")
-
-        mock_req.side_effect = response
-        result = json.loads(discord_core(action="fetch_messages", channel_id="31"))
-        assert "outside the configured Discord history scope" in result["error"]
-
-    @patch("tools.discord_tool._discord_request")
-    def test_list_channels_filters_to_allowed_category(self, mock_req, monkeypatch):
-        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
-        monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", "10")
-        monkeypatch.setattr("tools.discord_tool._tool_respects_channel_allowlist", lambda: True)
-        mock_req.return_value = [
-            {"id": "10", "name": "YCJDT", "type": 4, "position": 0},
-            {"id": "20", "name": "victus", "type": 0, "position": 0, "parent_id": "10"},
-            {"id": "11", "name": "Private", "type": 4, "position": 1},
-            {"id": "21", "name": "other", "type": 0, "position": 0, "parent_id": "11"},
-        ]
-        result = json.loads(discord_admin_handler(action="list_channels", guild_id="1"))
-        assert result["total_channels"] == 1
-        assert result["channel_groups"][0]["category"]["id"] == "10"
-        assert result["channel_groups"][0]["channels"][0]["id"] == "20"
-
-    @patch("tools.discord_tool._discord_request")
     def test_list_threads_combines_active_and_archived(self, mock_req, monkeypatch):
         monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
-        monkeypatch.setattr("tools.discord_tool._tool_respects_channel_allowlist", lambda: False)
+        monkeypatch.setattr("tools.discord_tool._configured_tool_guild_ids", lambda: {"1"})
 
         def response(method, path, token, **kwargs):
             if path == "/channels/20":
