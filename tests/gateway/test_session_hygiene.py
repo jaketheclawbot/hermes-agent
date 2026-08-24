@@ -58,6 +58,7 @@ class HygieneCaptureAdapter(BasePlatformAdapter):
     def __init__(self):
         super().__init__(PlatformConfig(enabled=True, token="fake-token"), Platform.TELEGRAM)
         self.sent = []
+        self.edits = []
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         return True
@@ -75,6 +76,17 @@ class HygieneCaptureAdapter(BasePlatformAdapter):
             }
         )
         return SendResult(success=True, message_id="hygiene-1")
+
+    async def edit_message(self, chat_id, message_id, content, metadata=None) -> SendResult:
+        self.edits.append(
+            {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "content": content,
+                "metadata": metadata,
+            }
+        )
+        return SendResult(success=True, message_id=message_id)
 
     async def get_chat_info(self, chat_id: str):
         return {"id": chat_id}
@@ -700,6 +712,16 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
     fake_run_agent.AIAgent = FakeInPlaceCompressAgent
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
+    (tmp_path / "config.yaml").write_text(
+        "compression:\n"
+        "  enabled: true\n"
+        "display:\n"
+        "  platforms:\n"
+        "    telegram:\n"
+        "      tool_progress: all\n"
+        "      tool_progress_grouping: rolling\n"
+    )
+
     gateway_run = importlib.import_module("gateway.run")
     GatewayRunner = gateway_run.GatewayRunner
 
@@ -784,6 +806,9 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
     # the just-archived rows (#61145). The hygiene handler must skip it.
     runner.session_store.rewrite_transcript.assert_not_called()
     runner._run_agent.assert_awaited_once()
+    assert adapter.sent[0]["content"] == "⏳ Compressing conversation context…"
+    assert adapter.edits[-1]["content"] == "⏳ Working…"
+    assert runner._run_agent.call_args.kwargs["progress_message_id"] == "hygiene-1"
     # A real in-place compaction IS a recovery, so the gate must have run and
     # cleared the streak. This is the positive half of the wiring contract.
     assert reset_calls, (

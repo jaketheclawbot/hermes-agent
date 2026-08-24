@@ -68,6 +68,7 @@ class TurnContext:
     #     send_progress_messages is scheduled) ----------------------------
     _progress_metadata: Optional[dict] = None
     _progress_reply_to: Optional[Any] = None
+    initial_progress_msg_id: Optional[str] = None
 
     # ------------------------------------------------------------------
     # run_sync extraction (second wave of the seam): the closed-over locals
