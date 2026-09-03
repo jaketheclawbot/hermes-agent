@@ -769,7 +769,7 @@ async def test_session_hygiene_turn_hold_budget_abandons_streaming_wait(
     runner._pending_approvals = {}
     runner._session_db = SimpleNamespace(_db=fake_db)
     runner._is_user_authorized = lambda _source: True
-    runner._set_session_env = lambda _context: None
+    runner._set_session_env = lambda _context, **_kwargs: None
     runner._run_agent = AsyncMock(
         return_value={
             "final_response": "ok",
@@ -946,7 +946,7 @@ async def test_session_hygiene_idle_timeout_still_takes_failure_path(
     runner._pending_approvals = {}
     runner._session_db = SimpleNamespace(_db=fake_db)
     runner._is_user_authorized = lambda _source: True
-    runner._set_session_env = lambda _context: None
+    runner._set_session_env = lambda _context, **_kwargs: None
     runner._run_agent = AsyncMock(
         return_value={
             "final_response": "ok",
