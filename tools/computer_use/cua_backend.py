@@ -4184,8 +4184,14 @@ class CuaDriverBackend(ComputerUseBackend):
         token = self._snapshot_tokens.get(idx)
         if not token:
             return
-        if not self._session.supports_capability(
-            "accessibility.element_tokens", tool=tool
+        # MCP SDK versions may discard nonstandard top-level capability
+        # fields. The advertised input schema is also an explicit contract;
+        # use it only for this property, never to infer authorization grants.
+        if not (
+            self._session.supports_capability(
+                "accessibility.element_tokens", tool=tool
+            )
+            or self._session.supports_input_property(tool, "element_token")
         ):
             return
         args["element_token"] = token
