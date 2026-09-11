@@ -66,6 +66,54 @@ def _drain_for(delegation_id, timeout=5.0):
     return None
 
 
+@pytest.mark.parametrize("delivery_state", ["pending", "dropped"])
+def test_pruning_preserves_unacknowledged_results(tmp_path, monkeypatch, delivery_state):
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    monkeypatch.setattr(ad, "_MAX_RETAINED_COMPLETED", 2)
+    monkeypatch.setattr(ad, "_MAX_DURABLE_PENDING", 2)
+    now = time.time()
+    with ad._transaction() as conn:
+        conn.executemany(
+            "INSERT INTO async_delegations "
+            "(delegation_id, origin_session, state, dispatched_at, updated_at, delivery_state, result_json) "
+            "VALUES (?, 'test', 'unknown', ?, ?, ?, ?)",
+            [(f"unacked-{i}", now, now, delivery_state, json.dumps({"evidence": i})) for i in range(4)],
+        )
+    ad._prune_durable_records()
+    ad._prune_durable_records()  # repeated maintenance must not erase evidence
+    # Exercise a fresh interpreter against the same disposable database: this
+    # does not restart or import the live gateway.
+    env = dict(os.environ, HERMES_HOME=str(tmp_path))
+    probe = subprocess.run(
+        [sys.executable, "-c", "from tools import async_delegation as ad; "
+         "ad._prune_durable_records(); print(ad.__file__)"],
+        cwd=os.path.dirname(os.path.dirname(ad.__file__)),
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert probe.returncode == 0, probe.stderr
+    assert os.path.realpath(probe.stdout.strip()) == os.path.realpath(ad.__file__)
+    with ad._transaction() as conn:
+        rows = conn.execute("SELECT delegation_id, delivery_state, result_json FROM async_delegations ORDER BY delegation_id").fetchall()
+    assert rows == [(f"unacked-{i}", delivery_state, json.dumps({"evidence": i})) for i in range(4)]
+
+
+def test_pruning_still_bounds_acknowledged_history(tmp_path, monkeypatch):
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    monkeypatch.setattr(ad, "_MAX_RETAINED_COMPLETED", 2)
+    now = time.time()
+    with ad._transaction() as conn:
+        conn.executemany(
+            "INSERT INTO async_delegations "
+            "(delegation_id, origin_session, state, dispatched_at, updated_at, delivery_state) "
+            "VALUES (?, 'test', 'completed', ?, ?, 'delivered')",
+            [(f"acked-{i}", now, now + i) for i in range(4)],
+        )
+    ad._prune_durable_records()
+    with ad._transaction() as conn:
+        rows = conn.execute("SELECT delegation_id FROM async_delegations ORDER BY delegation_id").fetchall()
+    assert rows == [("acked-2",), ("acked-3",)]
+
+
 def test_schema_init_preserves_shared_state_db_journal_mode(tmp_path):
     """The delegation ledger is a guest in state.db, not its mode owner."""
     conn = sqlite3.connect(tmp_path / "state.db")
@@ -648,6 +696,9 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     }
     # monkeypatch (not `with`) so patches outlive delegate_task's return and
     # remain active while the background worker runs.
+    # Fake children must not discover/run installed user plugins at teardown.
+    # Keep the real aggregator and its completion deadline; isolate only hooks.
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *a, **k: None)
     monkeypatch.setattr(dt, "_build_child_agent", lambda **kw: fake_child)
     monkeypatch.setattr(dt, "_run_single_child", slow_child)
     monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: creds)
@@ -705,6 +756,9 @@ def test_delegate_task_background_uses_live_tui_agent_session_id(monkeypatch):
         "model": "m", "provider": None, "base_url": None, "api_key": None,
         "api_mode": None, "command": None, "args": None,
     }
+    # Fake children must not discover/run installed user plugins at teardown.
+    # Keep the real aggregator and its completion deadline; isolate only hooks.
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *a, **k: None)
     monkeypatch.setattr(dt, "_build_child_agent", lambda **kw: fake_child)
     monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: creds)
     monkeypatch.setattr(

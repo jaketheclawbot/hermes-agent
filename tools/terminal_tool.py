@@ -3398,13 +3398,39 @@ def terminal_tool(
             # For non-local backends: runs inside the sandbox via env.execute().
             from tools.process_registry import process_registry
 
-            effective_cwd = _resolve_command_cwd(
-                workdir=workdir,
-                default_cwd=cwd,
-                session_key=session_key,
-                env_type=env_type,
-            )
+            # Resolve effective notification mode and routing before the first
+            # checkpoint/reader thread: a fast child can finish during spawn.
+            from gateway.session_context import async_delivery_supported, get_session_env
+            spawn_notify = bool(notify_on_complete) and async_delivery_supported()
+            notification_origin = {}
+            if spawn_notify:
+                for field, env_name in (
+                    ("watcher_platform", "PLATFORM"),
+                    ("watcher_chat_id", "CHAT_ID"),
+                    ("watcher_user_id", "USER_ID"),
+                    ("watcher_user_name", "USER_NAME"),
+                    ("watcher_thread_id", "THREAD_ID"),
+                    ("watcher_message_id", "MESSAGE_ID"),
+                    ("parent_session_id", "ID"),
+                ):
+                    notification_origin[field] = get_session_env("HERMES_SESSION_" + env_name, "")
+                notification_origin["watcher_interval"] = 5
+            notify_reserved = False
+            if spawn_notify:
+                notify_reserved = process_registry.reserve_notify_spawn()
+                if not notify_reserved:
+                    return json.dumps({
+                        "output": "", "exit_code": -1,
+                        "error": "Pending background completion backlog is full; accept existing notifications before starting another process.",
+                    })
+
             try:
+                effective_cwd = _resolve_command_cwd(
+                    workdir=workdir,
+                    default_cwd=cwd,
+                    session_key=session_key,
+                    env_type=env_type,
+                )
                 if env_type == "local":
                     proc_session = process_registry.spawn_local(
                         command=command,
@@ -3414,6 +3440,8 @@ def terminal_tool(
                         session_key=session_key,
                         env_vars=env.env if hasattr(env, 'env') else None,
                         use_pty=effective_pty,
+                        notify_on_complete=spawn_notify,
+                        notification_origin=notification_origin,
                     )
                 else:
                     proc_session = process_registry.spawn_via_env(
@@ -3423,6 +3451,8 @@ def terminal_tool(
                         task_id=effective_task_id,
                         owner_task_id=task_id or effective_task_id,
                         session_key=session_key,
+                        notify_on_complete=spawn_notify,
+                        notification_origin=notification_origin,
                     )
 
                 result_data = {
@@ -3654,6 +3684,9 @@ def terminal_tool(
                         f"Failed to start background process: {e}"
                     )
                 }, ensure_ascii=False)
+            finally:
+                if notify_reserved:
+                    process_registry.release_notify_spawn()
         else:
             # Run foreground command with retry logic
             max_retries = 3

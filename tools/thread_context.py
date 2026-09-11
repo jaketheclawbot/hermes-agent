@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import contextvars
 import logging
+import sys
 from typing import Callable
 
 logger = logging.getLogger(__name__)
@@ -47,12 +48,16 @@ def _callback_api():
     module load, so a top-level import here would risk an import cycle for
     callers that live in ``tools.approval``.
     """
-    from tools.terminal_tool import (
-        _get_approval_callback,
-        _get_sudo_password_callback,
-        set_approval_callback,
-        set_sudo_password_callback,
-    )
+    # If terminal_tool has not been imported, it cannot hold callbacks that
+    # need propagating. Avoid importing the entire terminal/tool registry on a
+    # background dispatch's synchronous path merely to discover four Nones.
+    module = sys.modules.get("tools.terminal_tool")
+    if module is None:
+        return None
+    _get_approval_callback = module._get_approval_callback
+    _get_sudo_password_callback = module._get_sudo_password_callback
+    set_approval_callback = module.set_approval_callback
+    set_sudo_password_callback = module.set_sudo_password_callback
     return (
         _get_approval_callback,
         _get_sudo_password_callback,
@@ -79,10 +84,12 @@ def propagate_context_to_thread(target: Callable) -> Callable:
     parent_approval_cb = parent_sudo_cb = None
     setters = None
     try:
-        get_approval, get_sudo, set_approval, set_sudo = _callback_api()
-        parent_approval_cb = get_approval()
-        parent_sudo_cb = get_sudo()
-        setters = (set_approval, set_sudo)
+        callback_api = _callback_api()
+        if callback_api is not None:
+            get_approval, get_sudo, set_approval, set_sudo = callback_api
+            parent_approval_cb = get_approval()
+            parent_sudo_cb = get_sudo()
+            setters = (set_approval, set_sudo)
     except Exception:
         logger.debug("Could not capture parent approval/sudo callbacks", exc_info=True)
 
