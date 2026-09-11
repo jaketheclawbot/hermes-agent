@@ -6385,6 +6385,9 @@ class BasePlatformAdapter(ABC):
         This allows new messages to be processed even while an agent is running,
         enabling interruption support.
         """
+        require_turn_acceptance = bool(getattr(event, "_require_turn_acceptance", False))
+        if require_turn_acceptance:
+            event._terminal_turn_accepted = False
         if not self._message_handler:
             return
 
@@ -6429,6 +6432,10 @@ class BasePlatformAdapter(ABC):
 
         # Check if there's already an active handler for this session
         if session_key in self._active_sessions:
+            if require_turn_acceptance:
+                # Durable completion watchers own retries. Do not merge their
+                # receipts into an unrelated queued user turn or interrupt it.
+                return
             # Certain commands must bypass the active-session guard and be
             # dispatched directly to the gateway runner.  Without this, they
             # are queued as pending messages and either:
@@ -6592,7 +6599,11 @@ class BasePlatformAdapter(ABC):
         # pattern — set the guard synchronously, not inside the task.)
         # _start_session_processing installs the guard AND the owner-task
         # mapping atomically so stale-lock detection works.
-        self._start_session_processing(event, session_key)
+        started = self._start_session_processing(event, session_key)
+        if require_turn_acceptance and started:
+            # Only durable synthetic producers wait; normal incoming messages
+            # retain their nonblocking dispatch/interrupt behavior.
+            await asyncio.shield(self._session_tasks[session_key])
     
     @staticmethod
     def _get_human_delay() -> float:

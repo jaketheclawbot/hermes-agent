@@ -7547,7 +7547,19 @@ class TurnRunner:
         # _attach_session_title_callback), because the titler now fires from
         # inside the turn prologue rather than from here.
 
+        # The normal agent flush catches I/O errors; mere agent completion (or
+        # an optimistic agent_persisted flag) is not a durable receipt.
+        turn_persisted = False
+        if agent is not None and result.get("completed") is True:
+            try:
+                turn_persisted = agent._flush_messages_to_session_db(
+                    result.get("messages", []), None
+                ) is True
+            except Exception:
+                logger.debug("Terminal turn receipt flush failed", exc_info=True)
         return {
+            "turn_persisted": turn_persisted,
+            "cleanup_errors": result.get("cleanup_errors"),
             "final_response": final_response,
             "last_reasoning": result.get("last_reasoning"),
             "messages": ctx.result_holder[0].get("messages", []) if ctx.result_holder[0] else [],
@@ -9600,7 +9612,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             + self._active_cron_job_count()
             + self._active_api_run_count()
             + self._active_deferred_agent_worker_count()
+            + self._active_notify_process_count()
         )
+
+    def _active_notify_process_count(self) -> int:
+        try:
+            from tools.process_registry import process_registry
+            return process_registry.active_notify_process_count()
+        except Exception:
+            return 0
 
     def _active_cron_job_count(self) -> int:
         """Count of cron jobs currently executing, from the cron scheduler's
@@ -11940,22 +11960,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         last_cron_count = self._active_cron_job_count()
         last_api_count = self._active_api_run_count()
         last_deferred_count = self._active_deferred_agent_worker_count()
+        last_notify_count = self._active_notify_process_count()
         last_status_at = 0.0
 
         def _maybe_update_status(force: bool = False) -> None:
             nonlocal last_active_count, last_cron_count, last_api_count
-            nonlocal last_deferred_count, last_status_at
+            nonlocal last_deferred_count, last_notify_count, last_status_at
             now = asyncio.get_running_loop().time()
             active_count = self._running_agent_count()
             cron_count = self._active_cron_job_count()
             api_count = self._active_api_run_count()
             deferred_count = self._active_deferred_agent_worker_count()
+            notify_count = self._active_notify_process_count()
             if (
                 force
                 or active_count != last_active_count
                 or cron_count != last_cron_count
                 or api_count != last_api_count
                 or deferred_count != last_deferred_count
+                or notify_count != last_notify_count
                 or (now - last_status_at) >= 1.0
             ):
                 self._update_runtime_status("draining")
@@ -11963,6 +11986,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 last_cron_count = cron_count
                 last_api_count = api_count
                 last_deferred_count = deferred_count
+                last_notify_count = notify_count
                 last_status_at = now
 
         # Cron jobs run on the scheduler's own thread pool, outside
@@ -11976,6 +12000,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             and last_cron_count == 0
             and last_api_count == 0
             and last_deferred_count == 0
+            and last_notify_count == 0
         ):
             _maybe_update_status(force=True)
             return snapshot, False
@@ -12000,6 +12025,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 len(self._running_agents)
                 or self._active_api_run_count()
                 or self._active_deferred_agent_worker_count()
+                or self._active_notify_process_count()
             ) and now < deadline:
                 return True
             return bool(self._active_cron_job_count()) and now < cron_deadline
@@ -12016,6 +12042,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             or bool(self._active_cron_job_count())
             or bool(self._active_api_run_count())
             or bool(self._active_deferred_agent_worker_count())
+            or bool(self._active_notify_process_count())
         )
         _maybe_update_status(force=True)
         return snapshot, timed_out
@@ -21670,6 +21697,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         # Set session context variables for tools (task-local, concurrency-safe)
         _session_env_tokens = self._set_session_env(context, cwd=session_workdir)
+        terminal_turn_owner = session_key
+        terminal_turn_accepted = False
+        terminal_observation = None
         
         # Read privacy.redact_pii from config (re-read per message)
         _redact_pii = False
@@ -23501,6 +23531,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # session_entry.session_id while the old run is still unwinding.
             _run_start_session_id = session_entry.session_id
             _turn_started_monotonic = time.monotonic()
+            from tools.process_registry import begin_terminal_observation_turn, end_terminal_observation_turn
+            terminal_observation = begin_terminal_observation_turn(terminal_turn_owner)
             agent_result = await self._run_agent(
                 message=message_text,
                 context_prompt=context_prompt,
@@ -24051,6 +24083,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 touch_activity=not bool(getattr(event, "internal", False)),
             )
 
+            terminal_turn_accepted = (
+                not agent_failed_early
+                and not hidden_reasoning_incomplete
+                and not agent_result.get("interrupted")
+                and not agent_result.get("partial")
+                and not agent_result.get("cleanup_errors")
+                and agent_result.get("completed") is True
+                and agent_result.get("turn_persisted") is True
+            )
+
             # Re-baseline the cached agent's message_count snapshot now that
             # ALL of this turn's transcript writes are done — the agent's
             # flushed user/assistant/tool rows AND the first-turn `session_meta`
@@ -24146,6 +24188,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             
         except Exception as e:
             # Stop typing indicator on error too, retaining Slack thread/workspace
+            terminal_turn_accepted = False
             # routing so a failed turn cannot leave its status visible.
             try:
                 _err_adapter = self._adapter_for_source(source)
@@ -24261,7 +24304,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         finally:
             # Restore session context variables to their pre-handler state
+            if getattr(event, "_require_turn_acceptance", False):
+                event._terminal_turn_accepted = bool(
+                    terminal_turn_accepted and sys.exc_info()[0] is None
+                )
+            if terminal_observation is not None:
+                turn, token = terminal_observation
+                end_terminal_observation_turn(turn, token)
+                self._finish_terminal_observation_turn(
+                    terminal_turn_owner,
+                    terminal_turn_accepted and sys.exc_info()[0] is None,
+                    turn["observed"],
+                )
             self._clear_session_env(_session_env_tokens)
+
+    def _finish_terminal_observation_turn(self, owner: str, accepted: bool, observed_ids=None) -> None:
+        from tools.process_registry import process_registry
+
+        if accepted:
+            # False registers an I/O-only retry on the existing idle rail.
+            process_registry.acknowledge_consumed_terminal_notifications(owner, observed_ids)
+        else:
+            process_registry.release_consumed_terminal_notifications(owner, observed_ids)
 
     def _reset_notice_session_info(self, source: SessionSource) -> str:
         """Session-info block for the auto-reset notice, profile-scoped.
@@ -28691,6 +28755,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message_id=str(evt.get("message_id") or "").strip() or None,
                 metadata=metadata,
             )
+            synth_event._require_turn_acceptance = evt.get("type") in {"completion", "async_delegation"}
             logger.info(
                 "Watch pattern notification — injecting for %s chat=%s thread=%s",
                 platform_name,
@@ -28707,7 +28772,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if callable(_prime):
                 _prime(synth_event)
             await adapter.handle_message(synth_event)
-            return True
+            # A queued task is not acceptance. Durable completions require the
+            # real handler's receipt; ordinary watch matches retain their API.
+            return (
+                not synth_event._require_turn_acceptance
+                or getattr(synth_event, "_terminal_turn_accepted", False) is True
+            )
         except Exception as e:
             logger.error("Watch notification injection error: %s", e)
             return False
@@ -28893,6 +28963,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "available via process(action='log')).",
                         evt.get("session_id") or "<unknown>", parent_session_id,
                     )
+                    try:
+                        from tools.process_registry import process_registry as _pr
+                        if not _pr.mark_terminal_notification_undeliverable(
+                            str(evt.get("session_id") or ""),
+                            "parent_session_closed",
+                        ):
+                            return False
+                    except Exception:
+                        logger.debug("Could not persist terminal process disposition", exc_info=True)
+                        return False
                     return None
                 if verdict == "retry":
                     # Transient uncertainty (session DB unavailable or a
@@ -28961,6 +29041,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Return a routing-complete key for short-window process fan-in."""
         return tuple(str(evt.get(field) or "") for field in (
             "session_key",
+            "parent_session_id",
+            "origin_profile",
+            "origin_hermes_home",
             "platform",
             "chat_type",
             "chat_id",
@@ -29322,6 +29405,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         while self._running:
             try:
                 # Peek the queue for async-delegation events. We must NOT
+                _pr.retry_accepted_terminal_acknowledgements()
                 # consume watch/completion events here (other drains own them),
                 # so requeue anything that isn't ours.
                 requeue = []
@@ -29411,11 +29495,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
 
         last_output_len = 0
+        delivery_accepted = False
         while True:
             await asyncio.sleep(interval)
 
+            # Retry persistence, not delivery: enqueue deduplicates an already
+            # accepted lifecycle as None, which is not a new acceptance.
+            if delivery_accepted:
+                if process_registry.acknowledge_terminal_notification(session_id):
+                    break
+                continue
+
             session = process_registry.get(session_id)
             if session is None:
+                break
+
+            if agent_notify and process_registry.is_completion_consumed(session_id):
+                # wait/log is an observation, not acceptance. Keep the existing
+                # watcher alive until the owning turn accepts or re-arms it.
+                getattr(process_registry, "retry_accepted_terminal_acknowledgements", lambda: None)()
+                if session_id in getattr(process_registry, "_pending_terminal_entries", {}):
+                    continue
                 break
 
             current_output_len = len(session.output_buffer)
@@ -29429,6 +29529,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # (#10156) — a status check must not suppress this delivery turn.
                 from tools.process_registry import format_process_notification, process_registry as _pr_check
                 if agent_notify and not _pr_check.is_completion_consumed(session_id):
+                    _ensure_terminal = getattr(
+                        _pr_check, "ensure_terminal_checkpoint", lambda _sid: True
+                    )
+                    if not _ensure_terminal(session_id):
+                        # The reader observed exit but its running->terminal
+                        # checkpoint failed. Keep this watcher alive as the
+                        # practical retry rail; never deliver unpersisted evidence.
+                        continue
                     from agent.redact import redact_terminal_output
                     from tools.ansi_strip import strip_ansi
                     _command = getattr(session, "command", "") or ""
@@ -29485,6 +29593,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # The process remains terminal; retry after failed
                         # adapter injection instead of suppressing the result.
                         continue
+                    if delivered is True:
+                        delivery_accepted = True
+                        _ack_terminal = getattr(
+                            _pr_check,
+                            "acknowledge_terminal_notification",
+                            lambda _sid: True,
+                        )
+                        if not _ack_terminal(session_id):
+                            # Adapter acceptance happened, but durable ack did
+                            # not. Retry the checkpoint write on this live rail;
+                            # lifecycle dedup prevents a duplicate injection.
+                            continue
                     break
 
                 # --- Normal text-only notification ---

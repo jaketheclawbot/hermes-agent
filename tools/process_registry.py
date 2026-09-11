@@ -47,16 +47,65 @@ _IS_WINDOWS = platform.system() == "Windows"
 # on this constant (not merely "not Windows") so macOS and other POSIX
 # platforms provably never touch systemd code (#70716 cross-platform audit).
 _IS_LINUX = platform.system() == "Linux"
-from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env
-from hermes_cli._subprocess_compat import windows_hide_flags
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from hermes_cli.config import get_hermes_home
+from hermes_constants import get_hermes_home
 
-from agent.redact import redact_sensitive_text
+
+def _local_helpers():
+    from tools.environments.local import (
+        _find_shell,
+        _resolve_safe_cwd,
+        _sanitize_subprocess_env,
+    )
+    return _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env
+
+
+def _find_shell(*args, **kwargs):
+    return _local_helpers()[0](*args, **kwargs)
+
+
+def _resolve_safe_cwd(*args, **kwargs):
+    return _local_helpers()[1](*args, **kwargs)
+
+
+def _sanitize_subprocess_env(*args, **kwargs):
+    return _local_helpers()[2](*args, **kwargs)
+
+
+def windows_hide_flags():
+    from hermes_cli._subprocess_compat import windows_hide_flags as _flags
+    return _flags()
+
+
+def redact_sensitive_text(*args, **kwargs):
+    from agent.redact import redact_sensitive_text as _redact
+    return _redact(*args, **kwargs)
 
 logger = logging.getLogger(__name__)
+
+
+class CheckpointPersistenceError(RuntimeError):
+    pass
+
+
+from contextvars import ContextVar
+
+_terminal_observation_turn = ContextVar("terminal_observation_turn", default=None)
+
+
+def begin_terminal_observation_turn(owner: str):
+    # Shared with copied worker contexts; closing it rejects late observations
+    # from an interrupted worker even after a newer turn has begun.
+    turn = {"owner": owner, "observed": set(), "active": True}
+    return turn, _terminal_observation_turn.set(turn)
+
+
+def end_terminal_observation_turn(turn, token):
+    with process_registry._lock:
+        turn["active"] = False
+    _terminal_observation_turn.reset(token)
 
 
 # Checkpoint file for crash recovery (gateway only)
@@ -66,6 +115,7 @@ CHECKPOINT_PATH = get_hermes_home() / "processes.json"
 MAX_OUTPUT_CHARS = 200_000      # 200KB rolling output buffer
 FINISHED_TTL_SECONDS = 1800     # Keep finished processes for 30 minutes
 MAX_PROCESSES = 64              # Max concurrent tracked processes (LRU pruning)
+MAX_PENDING_TERMINAL_NOTIFICATIONS = MAX_PROCESSES
 MAX_ACTIVE_PROCESS_AGE = 86400  # 24h default — see session_reset.bg_process_max_age_hours (#29177)
 
 # Watch pattern rate limiting — PER SESSION.
@@ -486,10 +536,17 @@ class ProcessRegistry:
         "tcsetattr: Inappropriate ioctl for device",
     )
 
-    def __init__(self):
+    def __init__(self, completion_queue=None):
         self._running: Dict[str, ProcessSession] = {}
         self._finished: Dict[str, ProcessSession] = {}
-        self._lock = threading.Lock()
+        # Checkpoint construction and replacement are one serialized operation.
+        # RLock lets mutation helpers call _write_checkpoint while preserving
+        # that single critical section.
+        self._lock = threading.RLock()
+        # Terminal outcomes are retained in processes.json until a consumer
+        # accepts them. This closes the checkpoint-removal crash window.
+        self._pending_terminal_entries: Dict[str, Dict[str, Any]] = {}
+        self._notify_spawn_reservations = 0
 
         # Side-channel for check_interval watchers (gateway reads after agent run)
         self.pending_watchers: List[Dict[str, Any]] = []
@@ -498,8 +555,10 @@ class ProcessRegistry:
         # Completion notifications (notify_on_complete) and watch pattern matches
         # both land here, distinguished by "type" field.  CLI process_loop and
         # gateway drain this after each agent turn to auto-trigger new turns.
-        import queue as _queue_mod
-        self.completion_queue: _queue_mod.Queue = _queue_mod.Queue()
+        if completion_queue is None:
+            from queue import Queue
+            completion_queue = Queue()
+        self.completion_queue = completion_queue
         # Rehydrate durable delegation completions only at registry startup.
         # Consumers still inject them as fresh turns through this existing rail.
         try:
@@ -513,6 +572,8 @@ class ProcessRegistry:
         # for these — a blocking wait() or a full read_log() means the agent
         # has the output in hand and is acting on it this turn.
         self._completion_consumed: set = set()
+        # Accepted observations awaiting only checkpoint I/O, never redelivery.
+        self._accepted_terminal_ack_retries: set = set()
 
         # Track sessions the agent merely *observed* exited via poll().  poll()
         # is a read-only status check, so it does NOT mark _completion_consumed
@@ -541,6 +602,24 @@ class ProcessRegistry:
         # terminal tab. Distinct from kill — the process keeps running; only the
         # UI view is dropped (the user can reopen it from the status stack).
         self.on_close = None
+
+    def reserve_notify_spawn(self) -> bool:
+        """Reserve bounded durable-notification capacity before subprocess spawn."""
+        with self._lock:
+            outstanding = (
+                len(self._pending_terminal_entries)
+                + sum(1 for s in self._running.values() if s.notify_on_complete)
+                + self._notify_spawn_reservations
+            )
+            if outstanding >= MAX_PENDING_TERMINAL_NOTIFICATIONS:
+                return False
+            self._notify_spawn_reservations += 1
+            return True
+
+    def release_notify_spawn(self) -> None:
+        with self._lock:
+            if self._notify_spawn_reservations:
+                self._notify_spawn_reservations -= 1
 
     @staticmethod
     def _clean_shell_noise(text: str) -> str:
@@ -1079,6 +1158,8 @@ class ProcessRegistry:
         env_vars: dict = None,
         use_pty: bool = False,
         owner_task_id: str = "",
+        notify_on_complete: bool = False,
+        notification_origin: Optional[Dict[str, Any]] = None,
     ) -> ProcessSession:
         """
         Spawn a background process locally.
@@ -1107,6 +1188,8 @@ class ProcessRegistry:
             session_key=session_key,
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
             started_at=time.time(),
+            notify_on_complete=notify_on_complete,
+            **(notification_origin or {}),
         )
 
         pty_scope_attempted = False
@@ -1170,17 +1253,28 @@ class ProcessRegistry:
                     name=f"proc-pty-reader-{session.id}",
                 )
                 session._reader_thread = reader
-                reader.start()
 
                 with self._lock:
                     self._prune_if_needed()
                     self._running[session.id] = session
 
-                self._write_checkpoint()
+                if self._write_checkpoint() is False:
+                    with self._lock:
+                        self._running.pop(session.id, None)
+                    try:
+                        pty_proc.kill(getattr(signal, "SIGKILL", signal.SIGTERM))
+                    except Exception:
+                        pass
+                    raise CheckpointPersistenceError(
+                        "Failed to persist background process checkpoint"
+                    )
+                reader.start()
                 return session
 
             except ImportError:
                 logger.warning("ptyprocess not installed, falling back to pipe mode")
+            except CheckpointPersistenceError:
+                raise
             except Exception as e:
                 logger.warning("PTY spawn failed (%s), falling back to pipe mode", e)
                 if pty_scope_attempted and session.systemd_unit:
@@ -1276,13 +1370,16 @@ class ProcessRegistry:
                 name=f"proc-reader-{session.id}",
             )
             session._reader_thread = reader
-            reader.start()
 
             with self._lock:
                 self._prune_if_needed()
                 self._running[session.id] = session
 
-            self._write_checkpoint()
+            if self._write_checkpoint() is False:
+                raise CheckpointPersistenceError(
+                    "Failed to persist background process checkpoint"
+                )
+            reader.start()
         except Exception:
             # Post-Popen setup failed — kill the orphaned subprocess (and any
             # descendants spawned via setsid) before re-raising so they do not
@@ -1311,6 +1408,8 @@ class ProcessRegistry:
                 proc.wait(timeout=5)
             except Exception:
                 pass
+            with self._lock:
+                self._running.pop(session.id, None)
             raise
 
         return session
@@ -1324,6 +1423,8 @@ class ProcessRegistry:
         session_key: str = "",
         timeout: int = 10,
         owner_task_id: str = "",
+        notify_on_complete: bool = False,
+        notification_origin: Optional[Dict[str, Any]] = None,
     ) -> ProcessSession:
         """
         Spawn a background process through a non-local environment backend.
@@ -1346,6 +1447,8 @@ class ProcessRegistry:
             started_at=time.time(),
             env_ref=env,
             pid_scope="sandbox",
+            notify_on_complete=notify_on_complete,
+            **(notification_origin or {}),
         )
 
         # Run the command in the sandbox with output capture
@@ -1405,7 +1508,6 @@ class ProcessRegistry:
                 name=f"proc-poller-{session.id}",
             )
             session._reader_thread = reader
-            reader.start()
 
         with self._lock:
             self._prune_if_needed()
@@ -1413,7 +1515,17 @@ class ProcessRegistry:
                 self._running[session.id] = session
 
         if not session.exited:
-            self._write_checkpoint()
+            if self._write_checkpoint() is False:
+                with self._lock:
+                    self._running.pop(session.id, None)
+                try:
+                    env.execute(f"kill {session.pid} 2>/dev/null", timeout=5)
+                except Exception:
+                    logger.warning("Could not stop uncheckpointed sandbox process %s", session.id)
+                raise CheckpointPersistenceError(
+                    "Failed to persist background process checkpoint"
+                )
+            reader.start()
 
         return session
 
@@ -1732,16 +1844,11 @@ class ProcessRegistry:
         with the reader thread), the second call is a no-op — no duplicate
         completion notification is enqueued.
         """
-        with self._lock:
-            was_running = self._running.pop(session.id, None) is not None
-            self._finished[session.id] = session
-        session._completion_event.set()
-        self._write_checkpoint()
-
         # Only enqueue completion notification on the FIRST move.  Without
         # this guard, kill_process() and the reader thread can both call
         # _move_to_finished(), producing duplicate [IMPORTANT: ...] messages.
-        if was_running and session.notify_on_complete:
+        notification = None
+        if session.notify_on_complete:
             from tools.ansi_strip import strip_ansi
             output_tail = strip_ansi(session.output_buffer[-2000:]) if session.output_buffer else ""
             notification = {
@@ -1761,9 +1868,167 @@ class ProcessRegistry:
                 "started_at": session.started_at,
             }
             _redact_process_result(notification)
+            pending_entry = {
+                "terminal_event": notification,
+                "session_id": session.id,
+                "pid": session.pid,
+                "pid_scope": session.pid_scope,
+                "host_start_time": session.host_start_time,
+                "notify_on_complete": True,
+                "watcher_platform": session.watcher_platform,
+                "watcher_chat_id": session.watcher_chat_id,
+                "watcher_user_id": session.watcher_user_id,
+                "watcher_user_name": session.watcher_user_name,
+                "watcher_thread_id": session.watcher_thread_id,
+                "watcher_message_id": session.watcher_message_id,
+                "watcher_interval": session.watcher_interval,
+                "parent_session_id": session.parent_session_id,
+            }
+        with self._lock:
+            was_running = self._running.pop(session.id, None) is not None
+            previous_finished = self._finished.get(session.id)
+            self._finished[session.id] = session
+            previous_pending = self._pending_terminal_entries.get(session.id)
+            if was_running and notification is not None:
+                self._pending_terminal_entries[session.id] = pending_entry
+            if not self._write_checkpoint():
+                # Publication is conditional on persistence. Restore the prior
+                # recoverable in-memory state; the old on-disk running row was
+                # never replaced and startup can classify it as interrupted.
+                if was_running:
+                    self._running[session.id] = session
+                if previous_finished is None:
+                    self._finished.pop(session.id, None)
+                else:
+                    self._finished[session.id] = previous_finished
+                if previous_pending is None:
+                    self._pending_terminal_entries.pop(session.id, None)
+                else:
+                    self._pending_terminal_entries[session.id] = previous_pending
+                return
+        session._completion_event.set()
+        if was_running and notification is not None:
             self.completion_queue.put(notification)
 
+    def acknowledge_terminal_notification(self, session_id: str) -> bool:
+        """Remove a durable terminal outcome only after consumer acceptance."""
+        with self._lock:
+            entry = self._pending_terminal_entries.pop(session_id, None)
+            if entry is not None and not self._write_checkpoint():
+                self._pending_terminal_entries[session_id] = entry
+                return False
+            self._accepted_terminal_ack_retries.discard(session_id)
+            return True
+
+    def mark_terminal_notification_undeliverable(
+        self, session_id: str, reason: str,
+    ) -> bool:
+        """Retain evidence for a conclusively closed route without replaying it.
+
+        The completed process remains queryable and its checkpoint row remains
+        durable, but a user-created session boundary must never be crossed just
+        to empty notification capacity.
+        """
+        with self._lock:
+            entry = self._pending_terminal_entries.get(session_id)
+            if entry is None:
+                return True
+            event = entry.get("terminal_event")
+            if not isinstance(event, dict):
+                return False
+            previous = dict(event)
+            event["delivery_terminal"] = True
+            event["delivery_terminal_reason"] = str(reason or "closed_session")
+            if not self._write_checkpoint():
+                entry["terminal_event"] = previous
+                return False
+            return True
+
+    def acknowledge_consumed_terminal_notifications(self, session_key: str, observed_ids=None) -> bool:
+        """Ack tool-observed outcomes after their owning parent turn succeeds."""
+        self.retry_accepted_terminal_acknowledgements()
+        if not session_key:
+            return True
+        with self._lock:
+            matched = {
+                sid: entry
+                for sid, entry in self._pending_terminal_entries.items()
+                if sid in self._completion_consumed
+                and (observed_ids is None or sid in observed_ids)
+                and sid not in self._accepted_terminal_ack_retries
+                and str(entry.get("terminal_event", {}).get("session_key") or "")
+                == str(session_key)
+            }
+            if not matched:
+                return True
+            for sid in matched:
+                self._pending_terminal_entries.pop(sid, None)
+            if not self._write_checkpoint():
+                self._pending_terminal_entries.update(matched)
+                self._accepted_terminal_ack_retries.update(matched)
+                return False
+            return True
+
+    def retry_accepted_terminal_acknowledgements(self) -> None:
+        """Existing idle drains/watchers retry writes without another parent turn."""
+        with self._lock:
+            for sid in tuple(self._accepted_terminal_ack_retries):
+                self.acknowledge_terminal_notification(sid)
+
+    def release_consumed_terminal_notifications(self, session_key: str, observed_ids=None) -> None:
+        """Re-arm this parent's observed outcomes after a rejected turn/ack."""
+        if not session_key:
+            return
+        with self._lock:
+            for sid, entry in self._pending_terminal_entries.items():
+                event = entry.get("terminal_event", {})
+                if (
+                    sid in self._completion_consumed
+                    and (observed_ids is None or sid in observed_ids)
+                    and sid not in self._accepted_terminal_ack_retries
+                    and str(event.get("session_key") or "")
+                    == str(session_key)
+                ):
+                    self._completion_consumed.discard(sid)
+                    self.completion_queue.put(dict(event, restored=True))
+
+    def ensure_terminal_checkpoint(self, session_id: str) -> bool:
+        """Retry an exited running->pending transition through an existing rail."""
+        with self._lock:
+            if session_id in self._pending_terminal_entries:
+                return True
+            session = self._running.get(session_id)
+            needs_retry = bool(
+                session is not None and session.exited and session.notify_on_complete
+            )
+            # Legacy/in-memory-only finished sessions predate durable terminal
+            # rows. Preserve their established delivery behavior; only an
+            # exited session still stranded in _running proves a failed
+            # transition that must be retried before notification.
+            if session is None and session_id in self._finished:
+                return True
+        if needs_retry:
+            self._move_to_finished(session)
+        with self._lock:
+            return session_id in self._pending_terminal_entries
+
+    def active_notify_process_count(self) -> int:
+        """Bounded terminal work that graceful gateway shutdown must drain."""
+        with self._lock:
+            return sum(1 for s in self._running.values()
+                       if s.notify_on_complete and not s.exited)
+
     # ----- Query Methods -----
+
+    def _mark_completion_consumed(self, session_id: str) -> None:
+        turn = _terminal_observation_turn.get()
+        with self._lock:
+            if turn is not None:
+                session = self._running.get(session_id) or self._finished.get(session_id)
+                if not turn["active"] or session is None or session.session_key != turn["owner"]:
+                    return
+                turn["observed"].add(session_id)
+            self._completion_consumed.add(session_id)
 
     def is_completion_consumed(self, session_id: str) -> bool:
         """Check if a completion notification was already consumed via wait/log."""
@@ -2010,6 +2275,7 @@ class ProcessRegistry:
         filter is provided, ownerless async-delegation events remain
         fail-closed and require positive proof.
         """
+        self.retry_accepted_terminal_acknowledgements()
         results: "list[tuple[dict, str]]" = []
         requeue: "list[dict]" = []
         # Lazily-read flag for subagent-owned process notifications
@@ -2299,7 +2565,7 @@ class ProcessRegistry:
             "showing": f"{len(selected)} lines",
         }
         if session.exited and observed_completion_output:
-            self._completion_consumed.add(session_id)
+            self._mark_completion_consumed(session.id)
         return result
 
     def wait(self, session_id: str, timeout: int = None) -> dict:
@@ -2360,7 +2626,7 @@ class ProcessRegistry:
             # child has already exited (issue #17327).
             self._reconcile_local_exit(session)
             if session.exited:
-                self._completion_consumed.add(session_id)
+                self._mark_completion_consumed(session.id)
                 result = {
                     "status": "exited",
                     "command": session.command,
@@ -2463,7 +2729,7 @@ class ProcessRegistry:
             # Only suppress the autonomous turn after its output is present in
             # the explicit kill result, matching wait/log consumption.
             if consume_output:
-                self._completion_consumed.add(session_id)
+                self._mark_completion_consumed(session.id)
             return result
 
         # Kill via PTY, Popen (local), or env execute (non-local)
@@ -2499,7 +2765,7 @@ class ProcessRegistry:
                         session.exit_code = None
                         output = strip_ansi(session.output_buffer[-2000:])
                     if consume_output:
-                        self._completion_consumed.add(session_id)
+                        self._mark_completion_consumed(session.id)
                     self._move_to_finished(session)
                     return {
                         "status": "already_exited",
@@ -2531,7 +2797,7 @@ class ProcessRegistry:
             with session._lock:
                 output = strip_ansi(session.output_buffer[-2000:])
                 if consume_output:
-                    self._completion_consumed.add(session_id)
+                    self._mark_completion_consumed(session.id)
                 session.exited = True
                 session.exit_code = -15  # SIGTERM
                 session.completion_reason = "killed"
@@ -2857,11 +3123,17 @@ class ProcessRegistry:
 
     def _prune_if_needed(self):
         """Remove oldest finished sessions if over MAX_PROCESSES. Must hold _lock."""
+        # Admission bounds live obligations. Keep their watcher/observation
+        # state until acceptance; TTL eviction must not kill the retry rail.
+        pending = {
+            sid for sid, entry in self._pending_terminal_entries.items()
+            if not entry.get("terminal_event", {}).get("delivery_terminal")
+        }
         # First prune expired finished sessions
         now = time.time()
         expired = [
             sid for sid, s in self._finished.items()
-            if (now - s.started_at) > FINISHED_TTL_SECONDS
+            if sid not in pending and (now - s.started_at) > FINISHED_TTL_SECONDS
         ]
         for sid in expired:
             del self._finished[sid]
@@ -2870,8 +3142,9 @@ class ProcessRegistry:
 
         # If still over limit, remove oldest finished
         total = len(self._running) + len(self._finished)
-        if total >= MAX_PROCESSES and self._finished:
-            oldest_id = min(self._finished, key=lambda sid: self._finished[sid].started_at)
+        prunable = self._finished.keys() - pending
+        if total >= MAX_PROCESSES and prunable:
+            oldest_id = min(prunable, key=lambda sid: self._finished[sid].started_at)
             del self._finished[oldest_id]
             self._completion_consumed.discard(oldest_id)
             self._poll_observed.discard(oldest_id)
@@ -2893,7 +3166,7 @@ class ProcessRegistry:
     def _write_checkpoint(
         self,
         extra_entries: Optional[List[Dict[str, Any]]] = None,
-    ):
+    ) -> bool:
         """Write running process metadata to checkpoint file atomically."""
         try:
             with self._lock:
@@ -2942,12 +3215,18 @@ class ProcessRegistry:
                         for item in extra_entries
                         if item.get("session_id") not in tracked_ids
                     )
-            
-            # Atomic write to avoid corruption on crash
-            from utils import atomic_json_write
-            atomic_json_write(CHECKPOINT_PATH, entries)
+                tracked_ids = {item.get("session_id") for item in entries}
+                entries.extend(item for sid, item in self._pending_terminal_entries.items()
+                               if sid not in tracked_ids)
+                # Atomic replacement prevents torn files; holding _lock through
+                # replacement also prevents an older snapshot overwriting a
+                # newer one in this process.
+                from utils import atomic_json_write
+                atomic_json_write(CHECKPOINT_PATH, entries)
+            return True
         except Exception as e:
             logger.debug("Failed to write checkpoint file: %s", e, exc_info=True)
+            return False
 
     def recover_from_checkpoint(self) -> int:
         """
@@ -2966,12 +3245,56 @@ class ProcessRegistry:
         recovered = 0
         unresolved_scope_entries: List[Dict[str, Any]] = []
         for entry in entries:
+            terminal_event = entry.get("terminal_event")
+            if isinstance(terminal_event, dict):
+                sid = str(terminal_event.get("session_id") or entry.get("session_id") or "")
+                if sid:
+                    with self._lock:
+                        self._pending_terminal_entries[sid] = entry
+                    delivery_terminal = bool(terminal_event.get("delivery_terminal"))
+                    if not delivery_terminal:
+                        self.completion_queue.put(dict(terminal_event, restored=True))
+                    session = ProcessSession(
+                        id=sid, command=terminal_event.get("command", "unknown"),
+                        task_id=terminal_event.get("task_id", ""),
+                        owner_task_id=terminal_event.get("owner_task_id", ""),
+                        session_key=terminal_event.get("session_key", ""),
+                        pid=entry.get("pid"), host_start_time=entry.get("host_start_time"),
+                        pid_scope=entry.get("pid_scope", "host"),
+                        started_at=terminal_event.get("started_at") or time.time(), detached=True,
+                        watcher_platform=entry.get("watcher_platform", ""),
+                        watcher_chat_id=entry.get("watcher_chat_id", ""),
+                        watcher_user_id=entry.get("watcher_user_id", ""),
+                        watcher_user_name=entry.get("watcher_user_name", ""),
+                        watcher_thread_id=entry.get("watcher_thread_id", ""),
+                        watcher_message_id=entry.get("watcher_message_id", ""),
+                        watcher_interval=max(float(entry.get("watcher_interval") or 1), .05),
+                        parent_session_id=entry.get("parent_session_id", ""),
+                        notify_on_complete=True,
+                    )
+                    session.exited = True
+                    session.exit_code = terminal_event.get("exit_code", -1)
+                    session.completion_reason = terminal_event.get("completion_reason", "interrupted_unknown")
+                    session.termination_source = terminal_event.get("termination_source", "")
+                    session.output_buffer = terminal_event.get("output", "")
+                    with self._lock:
+                        self._finished[sid] = session
+                    if not delivery_terminal:
+                        self.pending_watchers.append({
+                            "session_id": sid, "check_interval": session.watcher_interval,
+                            "session_key": session.session_key, "platform": session.watcher_platform,
+                            "chat_id": session.watcher_chat_id, "user_id": session.watcher_user_id,
+                            "user_name": session.watcher_user_name, "thread_id": session.watcher_thread_id,
+                            "message_id": session.watcher_message_id, "notify_on_complete": True,
+                            "parent_session_id": session.parent_session_id,
+                        })
+                continue
             pid = entry.get("pid")
             if not pid:
                 continue
 
             pid_scope = entry.get("pid_scope", "host")
-            if pid_scope != "host":
+            if pid_scope != "host" and not entry.get("notify_on_complete"):
                 # Sandbox-backed processes keep only in-sandbox PIDs in the
                 # checkpoint, which are not meaningful to the restarted host
                 # process once the original environment handle is gone.
@@ -2990,15 +3313,15 @@ class ProcessRegistry:
             # watcher tree-kill a stranger (e.g. a browser). Re-validate the
             # kernel start time recorded in the checkpoint.
             recorded_start = entry.get("host_start_time")
-            if not self._host_pid_is_ours(pid, recorded_start):
-                if self._is_host_pid_alive(pid):
+            if pid_scope != "host" or not self._host_pid_is_ours(pid, recorded_start):
+                if pid_scope == "host" and self._is_host_pid_alive(pid):
                     logger.info(
                         "Not recovering session %s: pid %d is alive but its "
                         "start time no longer matches — PID was recycled onto "
                         "an unrelated process; refusing to adopt it.",
                         entry.get("session_id", "?"), pid,
                     )
-                systemd_unit = entry.get("systemd_unit", "")
+                systemd_unit = entry.get("systemd_unit", "") if pid_scope == "host" else ""
                 if systemd_unit and not _stop_systemd_unit(systemd_unit):
                     logger.warning(
                         "Could not reap persisted scope %s for dead wrapper pid %s; "
@@ -3007,6 +3330,53 @@ class ProcessRegistry:
                         pid,
                     )
                     unresolved_scope_entries.append(entry)
+                if entry.get("notify_on_complete"):
+                    event = {
+                        "type": "completion", "session_id": entry.get("session_id", "unknown"),
+                        "session_key": entry.get("session_key", ""),
+                        "task_id": entry.get("task_id", ""),
+                        "owner_task_id": entry.get("owner_task_id", entry.get("task_id", "")),
+                        "command": entry.get("command", "unknown"), "exit_code": -1,
+                        "completion_reason": "interrupted_unknown",
+                        "termination_source": "gateway_restart",
+                        "output": "Process identity or outcome could not be recovered after restart; no exit status is known.",
+                        "started_at": entry.get("started_at"), "restored": True,
+                    }
+                    pending = dict(entry, terminal_event=event)
+                    with self._lock:
+                        self._pending_terminal_entries[event["session_id"]] = pending
+                    self.completion_queue.put(event)
+                    session = ProcessSession(
+                        id=event["session_id"], command=event["command"],
+                        task_id=event["task_id"], owner_task_id=event["owner_task_id"],
+                        session_key=event["session_key"], pid=pid,
+                        host_start_time=recorded_start, pid_scope=pid_scope,
+                        started_at=entry.get("started_at", time.time()), detached=True,
+                        watcher_platform=entry.get("watcher_platform", ""),
+                        watcher_chat_id=entry.get("watcher_chat_id", ""),
+                        watcher_user_id=entry.get("watcher_user_id", ""),
+                        watcher_user_name=entry.get("watcher_user_name", ""),
+                        watcher_thread_id=entry.get("watcher_thread_id", ""),
+                        watcher_message_id=entry.get("watcher_message_id", ""),
+                        watcher_interval=max(float(entry.get("watcher_interval") or 1), .05),
+                        parent_session_id=entry.get("parent_session_id", ""),
+                        notify_on_complete=True,
+                    )
+                    session.exited = True
+                    session.exit_code = -1
+                    session.completion_reason = "interrupted_unknown"
+                    session.termination_source = "gateway_restart"
+                    session.output_buffer = event["output"]
+                    with self._lock:
+                        self._finished[session.id] = session
+                    self.pending_watchers.append({
+                        "session_id": session.id, "check_interval": session.watcher_interval,
+                        "session_key": session.session_key, "platform": session.watcher_platform,
+                        "chat_id": session.watcher_chat_id, "user_id": session.watcher_user_id,
+                        "user_name": session.watcher_user_name, "thread_id": session.watcher_thread_id,
+                        "message_id": session.watcher_message_id, "notify_on_complete": True,
+                        "parent_session_id": session.parent_session_id,
+                    })
                 continue
 
             session = ProcessSession(
@@ -3060,7 +3430,9 @@ class ProcessRegistry:
 
 
 # Module-level singleton
-process_registry = ProcessRegistry()
+from tools.completion_queue import completion_queue as _shared_completion_queue
+
+process_registry = ProcessRegistry(completion_queue=_shared_completion_queue)
 
 
 def _format_age(seconds: float) -> str:
