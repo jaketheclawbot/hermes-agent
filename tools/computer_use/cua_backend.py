@@ -1790,6 +1790,9 @@ class _CuaDriverSession:
                 command, args = self._embedded_daemon.proxy_invocation()
                 child_env = self._embedded_daemon.child_env()
             else:
+                if _computer_use_cfg().get("pinned_stdio_transport"):
+                    from tools.computer_use.pinned_stdio import enabled
+                    enabled(_computer_use_cfg(), "unrestricted", driver_cmd)
                 command, args = _resolve_mcp_invocation(driver_cmd)
                 child_env = cua_driver_child_env()
             _t_manifest = _time.monotonic()
@@ -2207,6 +2210,8 @@ class _CuaDriverSession:
         import time as _time
         from tools.environments.local import _sanitize_subprocess_env
 
+        if _computer_use_cfg().get("pinned_stdio_transport"):
+            raise RuntimeError("Pinned stdio transport cannot fall back to an unrelated machine-wide daemon")
         call_args = dict(args)
         shot_file: Optional[str] = None
         if name == "get_window_state" and "screenshot_out_file" not in call_args:
@@ -2720,7 +2725,13 @@ class CuaDriverBackend(ComputerUseBackend):
         if permission_mode not in {"standard", "bounded", "unrestricted"}:
             raise ValueError(f"unsupported cua-driver permission mode: {permission_mode}")
         self.permission_mode = permission_mode
-        if permission_mode == "unrestricted":
+        from tools.computer_use.pinned_stdio import enabled as pinned_stdio_enabled
+        self._pinned_stdio = pinned_stdio_enabled(
+            _computer_use_cfg(), permission_mode, resolve_cua_driver_cmd() or ""
+        )
+        if self._pinned_stdio:
+            self._embedded_daemon = None
+        elif permission_mode == "unrestricted":
             # Carry the manifest into unrestricted too. It is optional here
             # (unlike bounded), but when the user declared one it still caps
             # what an approval-bypassed run may touch.
