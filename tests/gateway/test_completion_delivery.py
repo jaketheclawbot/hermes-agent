@@ -34,6 +34,11 @@ def isolated_registry(tmp_path, monkeypatch):
 
 
 def _runner(adapter, *, origins=None):
+    original_handle = adapter.handle_message
+    async def accepted_handle(event):
+        await original_handle(event)
+        event._terminal_turn_accepted = True
+    adapter.handle_message = AsyncMock(side_effect=accepted_handle)
     runner = object.__new__(GatewayRunner)
     runner._running = True
     runner.adapters = {Platform.TELEGRAM: adapter}

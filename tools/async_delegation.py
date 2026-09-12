@@ -38,7 +38,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
+import sys
 import threading
 import time
 import uuid
@@ -89,6 +91,8 @@ _MAX_DELIVERY_ATTEMPTS = 8
 # deliverable while stopping weeks-old sessions from replaying after upgrades.
 _MAX_COMPLETION_REPLAY_AGE_S = 48 * 3600.0
 _DB_LOCK = threading.Lock()
+_SCHEMA_CACHE_LOCK = threading.Lock()
+_SCHEMA_INITIALIZED_PATHS: dict[str, tuple[int, int]] = {}
 
 # ---------------------------------------------------------------------------
 # Stale-delegation detection (progress-based, on by default)
@@ -130,7 +134,21 @@ def _connect() -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path, timeout=10)
     try:
-        _initialize_schema(conn)
+        cache_key = str(path.resolve())
+        try:
+            stat = path.stat()
+            file_identity = (stat.st_dev, stat.st_ino)
+        except OSError:
+            file_identity = (-1, -1)
+        with _SCHEMA_CACHE_LOCK:
+            initialized = _SCHEMA_INITIALIZED_PATHS.get(cache_key) == file_identity
+        if initialized:
+            _apply_connection_durability(conn)
+        else:
+            _initialize_schema(conn)
+            stat = path.stat()
+            with _SCHEMA_CACHE_LOCK:
+                _SCHEMA_INITIALIZED_PATHS[cache_key] = (stat.st_dev, stat.st_ino)
     except Exception:
         # A PRAGMA/DDL failure after a successful connect() must not leak the
         # just-opened connection back to the caller.
@@ -140,8 +158,6 @@ def _connect() -> sqlite3.Connection:
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:
-    from hermes_state import apply_durability_barriers
-
     # state.db's owning SessionDB connection establishes the configured journal
     # mode. This secondary durability ledger must preserve that mode: applying
     # WAL here on every short-lived connection requires an exclusive lock when
@@ -150,7 +166,11 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     # file first, the default rollback journal remains valid until SessionDB
     # establishes the configured mode. sqlite3.connect(timeout=10) above also
     # gives its small transactions a busy handler for ordinary contention.
-    apply_durability_barriers(conn)
+    # Keep this guest connection durable without importing ``hermes_state``.
+    # That module initializes the full agent/session stack and used to add
+    # many seconds to the synchronous side of a background dispatch. SQLite's
+    # default is FULL; spell out the Darwin barriers that state.db requires.
+    _apply_connection_durability(conn)
     conn.execute(
         """CREATE TABLE IF NOT EXISTS async_delegations (
             delegation_id TEXT PRIMARY KEY,
@@ -189,6 +209,12 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     ):
         if name not in columns:
             conn.execute(f"ALTER TABLE async_delegations ADD COLUMN {name} {sql_type}")
+
+
+def _apply_connection_durability(conn: sqlite3.Connection) -> None:
+    if sys.platform == "darwin":
+        conn.execute("PRAGMA checkpoint_fullfsync=ON")
+        conn.execute("PRAGMA synchronous=FULL")
 
 
 @contextmanager
@@ -241,11 +267,14 @@ def _capture_routing_origin() -> Dict[str, Any]:
     return origin
 
 
-def _persist_dispatch(record: Dict[str, Any]) -> None:
+def _persist_dispatch(record: Dict[str, Any]) -> bool:
     now = time.time()
     try:
-        from gateway.status import get_process_start_time
-        owner_started_at = get_process_start_time(__import__("os").getpid())
+        import psutil  # type: ignore
+
+        owner_started_at = int(
+            round(psutil.Process(os.getpid()).create_time() * 100)
+        )
     except Exception:
         owner_started_at = None
     task_payload = {
@@ -260,6 +289,15 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
         if key in record
     }
     with _DB_LOCK, _transaction() as conn:
+        # Serialize the capacity decision with insertion across processes.
+        # A deferred SELECT followed by INSERT lets two gateway processes both
+        # observe the last slot and over-admit.
+        conn.execute("BEGIN IMMEDIATE")
+        unresolved = conn.execute(
+            "SELECT COUNT(*) FROM async_delegations WHERE delivery_state!='delivered'"
+        ).fetchone()[0]
+        if unresolved >= _MAX_DURABLE_PENDING:
+            return False
         conn.execute(
             """INSERT OR REPLACE INTO async_delegations
                (delegation_id, origin_session, origin_ui_session_id,
@@ -269,11 +307,12 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
                VALUES (?, ?, ?, ?, 'running', ?, ?, 'pending', 0, ?, ?, ?, ?)""",
             (record["delegation_id"], record.get("session_key", ""),
              record.get("origin_ui_session_id", ""), record.get("parent_session_id"),
-             record["dispatched_at"], now, __import__("os").getpid(),
+             record["dispatched_at"], now, os.getpid(),
              owner_started_at, json.dumps(task_payload),
              record.get("origin_session_id", "")),
         )
     _prune_durable_records()
+    return True
 
 
 def _delete_durable_delegation(delegation_id: str) -> None:
@@ -282,7 +321,11 @@ def _delete_durable_delegation(delegation_id: str) -> None:
 
 
 def _prune_durable_records() -> None:
-    """Bound terminal history, preferring delivered records for deletion."""
+    """Bound acknowledged history without erasing unresolved result evidence.
+
+    A replay marked dropped is not a delivery acknowledgement. Capacity pressure
+    must be handled at admission or by explicit archival, not by losing results.
+    """
     now = time.time()
     cutoff = now - _DURABLE_RETENTION_SECONDS
     with _DB_LOCK, _transaction() as conn:
@@ -291,16 +334,15 @@ def _prune_durable_records() -> None:
             (cutoff,),
         )
         terminal_count = conn.execute(
-            "SELECT COUNT(*) FROM async_delegations WHERE state NOT IN ('running','finalizing')"
+            "SELECT COUNT(*) FROM async_delegations WHERE delivery_state='delivered'"
         ).fetchone()[0]
         excess = max(0, terminal_count - _MAX_RETAINED_COMPLETED)
         if excess:
             conn.execute(
                 """DELETE FROM async_delegations WHERE delegation_id IN (
                      SELECT delegation_id FROM async_delegations
-                     WHERE state NOT IN ('running','finalizing')
-                     ORDER BY CASE delivery_state WHEN 'delivered' THEN 0 ELSE 1 END,
-                              updated_at ASC LIMIT ?
+                     WHERE delivery_state='delivered'
+                     ORDER BY updated_at ASC, delegation_id LIMIT ?
                    )""",
                 (excess,),
             )
@@ -310,13 +352,10 @@ def _prune_durable_records() -> None:
         ).fetchone()[0]
         overflow = max(0, pending_count - _MAX_DURABLE_PENDING)
         if overflow:
-            conn.execute(
-                """DELETE FROM async_delegations WHERE delegation_id IN (
-                     SELECT delegation_id FROM async_delegations
-                     WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'
-                     ORDER BY updated_at ASC LIMIT ?
-                   )""",
-                (overflow,),
+            logger.warning(
+                "Async delegation pending result backlog exceeds capacity by %d; "
+                "preserving unacknowledged evidence (operator reconciliation required).",
+                overflow,
             )
 
 
@@ -342,10 +381,18 @@ def _note_delivery_attempt(delegation_id: str) -> None:
 
 def recover_abandoned_delegations() -> int:
     """Classify records whose owning process disappeared as outcome unknown."""
-    try:
-        from gateway.status import _pid_exists, get_process_start_time
-    except Exception:
-        return 0
+    def _pid_identity(pid: int) -> tuple[Optional[bool], Optional[int]]:
+        try:
+            import psutil  # type: ignore
+            process = psutil.Process(pid)
+            if not process.is_running() or process.status() == psutil.STATUS_ZOMBIE:
+                return False, None
+            return True, int(round(process.create_time() * 100))
+        except psutil.NoSuchProcess:
+            return False, None
+        except (psutil.AccessDenied, OSError):
+            return None, None
+
     now = time.time()
     recovered = 0
     with _DB_LOCK, _transaction() as conn:
@@ -360,9 +407,11 @@ def recover_abandoned_delegations() -> int:
              pid, started, task_json, origin_session_id) = row
             live = False
             if pid:
-                live = _pid_exists(int(pid))
+                live, live_started = _pid_identity(int(pid))
+                if live is None:
+                    continue
                 if live and started is not None:
-                    live = get_process_start_time(int(pid)) == int(started)
+                    live = live_started == int(started)
             if live:
                 continue
             task = json.loads(task_json or "{}")
@@ -861,8 +910,17 @@ def dispatch_async_delegation(
             }
         _records[delegation_id] = record
 
-    _persist_dispatch(record)
-    executor = _get_executor(max_async_children)
+    try:
+        persisted = _persist_dispatch(record)
+    except Exception as exc:
+        logger.exception("Failed to persist async delegation %s", delegation_id)
+        with _records_lock:
+            _records.pop(delegation_id, None)
+        return {"status": "rejected", "error": f"Failed to persist async delegation: {exc}"}
+    if not persisted:
+        with _records_lock:
+            _records.pop(delegation_id, None)
+        return {"status": "rejected", "error": "Async delegation result backlog is full; acknowledge pending results before dispatching more work."}
 
     def _worker() -> None:
         result: Dict[str, Any] = {}
@@ -886,6 +944,7 @@ def dispatch_async_delegation(
     try:
         # Propagate the dispatching profile so the detached child resolves
         # get_hermes_home() under the right profile.
+        executor = _get_executor(max_async_children)
         executor.submit(propagate_context_to_thread(_worker))
     except Exception as exc:  # pragma: no cover — pool submit failure is rare
         with _records_lock:
@@ -953,15 +1012,7 @@ def _push_completion_event(
     Best-effort: a failure here must not crash the worker, but it WOULD mean a
     silently-lost result, so we log loudly.
     """
-    try:
-        from tools.process_registry import process_registry
-    except Exception as exc:  # pragma: no cover
-        logger.error(
-            "Async delegation %s finished but process_registry import failed; "
-            "result lost: %s",
-            record.get("delegation_id"), exc,
-        )
-        return
+    from tools.completion_queue import completion_queue
 
     summary = result.get("summary")
     error = result.get("error")
@@ -1011,11 +1062,11 @@ def _push_completion_event(
             evt[_k] = result[_k]
     _persist_completion(evt, result)
     try:
-        process_registry.completion_queue.put(evt)
+        completion_queue.put(evt)
     except Exception as exc:  # pragma: no cover
         logger.error(
             "Async delegation %s: failed to enqueue completion event; "
-            "result lost: %s",
+            "durable result will replay after restart: %s",
             record.get("delegation_id"), exc,
         )
 
@@ -1104,8 +1155,17 @@ def dispatch_async_delegation_batch(
             }
         _records[delegation_id] = record
 
-    _persist_dispatch(record)
-    executor = _get_executor(max_async_children)
+    try:
+        persisted = _persist_dispatch(record)
+    except Exception as exc:
+        logger.exception("Failed to persist async delegation batch %s", delegation_id)
+        with _records_lock:
+            _records.pop(delegation_id, None)
+        return {"status": "rejected", "error": f"Failed to persist async delegation: {exc}"}
+    if not persisted:
+        with _records_lock:
+            _records.pop(delegation_id, None)
+        return {"status": "rejected", "error": "Async delegation result backlog is full; acknowledge pending results before dispatching more work."}
 
     def _worker() -> None:
         combined: Dict[str, Any] = {}
@@ -1134,6 +1194,7 @@ def dispatch_async_delegation_batch(
 
     try:
         # Propagate the dispatching profile to the detached batch children.
+        executor = _get_executor(max_async_children)
         executor.submit(propagate_context_to_thread(_worker))
     except Exception as exc:  # pragma: no cover
         with _records_lock:
@@ -1609,3 +1670,5 @@ def _reset_for_tests() -> None:
         thread.join(timeout=2)
     with _records_lock:
         _records.clear()
+    with _SCHEMA_CACHE_LOCK:
+        _SCHEMA_INITIALIZED_PATHS.clear()

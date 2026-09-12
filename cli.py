@@ -5173,6 +5173,17 @@ class _SeededQueryMessage:
         return self.text
 
 
+class _DurableCompletionMessage:
+    """Synthetic turn whose producer is acknowledged after the turn returns."""
+
+    __slots__ = ("text", "event", "claim")
+
+    def __init__(self, text: str, event: dict, claim: str):
+        self.text = text
+        self.event = event
+        self.claim = claim
+
+
 def _should_seed_interactive(query, image, quiet: bool, oneshot: bool) -> bool:
     """Whether a ``-q/--image`` invocation should seed an interactive session.
 
@@ -13604,7 +13615,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         from tools.process_registry import process_registry
         from tools.async_delegation import (
             claim_event_delivery,
-            complete_event_delivery,
         )
 
         session_key = getattr(self, "session_id", "") or ""
@@ -13615,8 +13625,120 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             claim = claim_event_delivery(event, consumer)
             if claim is None:
                 continue
-            self._pending_input.put(synthetic_message)
-            complete_event_delivery(event, claim)
+            self._pending_input.put(
+                _DurableCompletionMessage(synthetic_message, event, claim)
+            )
+
+    def _acknowledge_durable_completion(
+        self, message: _DurableCompletionMessage
+    ) -> bool:
+        """Acknowledge producer evidence after its synthetic turn completed."""
+        from tools.async_delegation import complete_event_delivery
+        from tools.process_registry import process_registry
+
+        complete_event_delivery(message.event, message.claim)
+        if message.event.get("type") == "completion":
+            session_id = str(message.event.get("session_id") or "")
+            accepted = process_registry.acknowledge_terminal_notification(session_id)
+            if not accepted:
+                pending = getattr(self, "_pending_terminal_ack_retries", None)
+                if not isinstance(pending, set):
+                    pending = set()
+                    self._pending_terminal_ack_retries = pending
+                pending.add(session_id)
+                return False
+        return True
+
+    def _retry_terminal_acknowledgements(self) -> None:
+        """Retry accepted-delivery checkpoint writes on the existing idle rail."""
+        from tools.process_registry import process_registry
+
+        pending = getattr(self, "_pending_terminal_ack_retries", None)
+        if not isinstance(pending, set):
+            return
+        for session_id in tuple(pending):
+            if process_registry.acknowledge_terminal_notification(session_id):
+                pending.discard(session_id)
+
+    def _finish_terminal_turn_acceptance(
+        self,
+        durable_completion: Optional[_DurableCompletionMessage],
+        owner_session_id: str,
+        observed_ids=None,
+    ) -> bool:
+        """Commit only obligations accepted by this exact durable parent turn."""
+        from tools.async_delegation import release_event_delivery
+        from tools.process_registry import process_registry
+
+        observed = {} if observed_ids is None else {"observed_ids": observed_ids}
+        if getattr(self, "_last_turn_durably_accepted", False) is not True:
+            if durable_completion is not None:
+                release_event_delivery(
+                    durable_completion.event, durable_completion.claim
+                )
+                # Claim release alone does not put a failed synthetic turn
+                # back on the live rail. Avoid duplicating a tool-observed row
+                # that release_consumed below already re-arms.
+                event = durable_completion.event
+                if event.get("type") != "completion" or event.get("session_id") not in (observed_ids or ()):
+                    process_registry.completion_queue.put(event)
+            process_registry.release_consumed_terminal_notifications(
+                owner_session_id, **observed
+            )
+            return False
+
+        if durable_completion is not None:
+            self._acknowledge_durable_completion(durable_completion)
+        if not process_registry.acknowledge_consumed_terminal_notifications(
+            owner_session_id, **observed
+        ):
+            # Registry retains these exact accepted rows for I/O-only retry
+            # on the idle drain. Do not inject a duplicate parent turn.
+            return False
+        return True
+
+    def _chat_with_terminal_acceptance(self, message, durable_completion=None, **kwargs):
+        """The process-loop boundary, including chat's early/error returns."""
+        from tools.process_registry import begin_terminal_observation_turn, end_terminal_observation_turn
+        owner = self.session_id or ""
+        if durable_completion is not None and not self._owns_process_notification(durable_completion.event):
+            self._last_turn_durably_accepted = False
+            self._finish_terminal_turn_acceptance(durable_completion, owner, set())
+            return None
+        turn, token = begin_terminal_observation_turn(owner)
+        self._last_turn_durably_accepted = False
+        try:
+            return self.chat(message, **kwargs)
+        except BaseException:
+            self._last_turn_durably_accepted = False
+            raise
+        finally:
+            end_terminal_observation_turn(turn, token)
+            self._finish_terminal_turn_acceptance(durable_completion, owner, turn["observed"])
+
+    def _record_chat_turn_acceptance(self, result) -> bool:
+        """Publish a receipt only for a successful, durably flushed turn."""
+        accepted = bool(
+            isinstance(result, dict)
+            and result.get("completed") is True
+            and result.get("failed") is not True
+            and result.get("partial") is not True
+            and result.get("interrupted") is not True
+            and not result.get("cleanup_errors")
+            and not getattr(self, "_last_turn_interrupted", False)
+        )
+        if accepted:
+            try:
+                accepted = (
+                    self.agent._flush_messages_to_session_db(
+                        self.conversation_history, None
+                    )
+                    is True
+                )
+            except Exception:
+                accepted = False
+        self._last_turn_durably_accepted = accepted
+        return accepted
 
     def _drain_interrupt_queue_to_pending_input(self) -> None:
         """Move stray messages from ``_interrupt_queue`` into ``_pending_input``.
@@ -16972,6 +17094,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         Returns:
             The agent's response, or None on error
         """
+        # A normal return is not an acceptance receipt: this method converts
+        # provider, interrupt, and persistence failures into displayable return
+        # values. Reset before every early-return path and arm only after the
+        # final transcript flush below succeeds.
+        self._last_turn_durably_accepted = False
+
         # Single-query and direct chat callers do not go through run(), so
         # register secure secret capture here as well.
         set_secret_capture_callback(self._secret_capture_callback)
@@ -17366,7 +17494,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # finishes; reset on the next turn.
             self._prompt_start_time = time.time()
             self._prompt_duration = 0.0
-            agent_thread = threading.Thread(target=run_agent, daemon=True)
+            from tools.thread_context import propagate_context_to_thread
+            agent_thread = threading.Thread(target=propagate_context_to_thread(run_agent), daemon=True)
             agent_thread.start()
 
             # Ambient "thinking" sound: calm bubble blips while the agent
@@ -17562,7 +17691,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             _interrupted_this_turn = bool(result and result.get("interrupted"))
             # Expose the flag for post-turn hooks (e.g. goal continuation)
             # so they can skip themselves when the turn was user-cancelled.
-            self._last_turn_interrupted = _interrupted_this_turn
+            self._last_turn_interrupted = bool(_interrupted_this_turn or interrupt_msg)
             if _interrupted_this_turn:
                 pending_message = result.get("interrupt_message") or interrupt_msg
                 # #60920: Don't append the interruption marker to response so it
@@ -17773,6 +17902,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 print(f"\n⏩ Delivering leftover /steer as next turn: '{preview}'")
                 self._pending_input.put(_leftover_steer)
 
+            self._record_chat_turn_acceptance(result)
             return response
             
         except Exception as e:
@@ -18231,6 +18361,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         """Run the interactive CLI loop with persistent input at bottom."""
         if not self._claim_active_session("cli"):
             return
+
+        # CLI is a first-class recovery host, not merely a consumer in tests.
+        # Restore terminal evidence before its first idle drain so completions
+        # replay into their owning resumed session after a process restart.
+        try:
+            from tools.process_registry import process_registry
+            process_registry.recover_from_checkpoint()
+        except Exception:
+            logger.warning("CLI process checkpoint recovery failed", exc_info=True)
 
         # Detect light/dark terminal mode now (before pt grabs the tty).
         # Caches the result so subsequent _hex_to_ansi / style calls
@@ -21060,6 +21199,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             # Check for background process notifications (completions
                             # and watch pattern matches) while agent is idle.
                             try:
+                                self._retry_terminal_acknowledgements()
                                 self._drain_process_notifications("cli-idle")
                             except Exception:
                                 pass
@@ -21070,6 +21210,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             except Exception:
                                 pass
                         continue
+
+                    durable_completion = (
+                        user_input
+                        if isinstance(user_input, _DurableCompletionMessage)
+                        else None
+                    )
+                    if durable_completion is not None:
+                        user_input = durable_completion.text
 
                     # Voice-transcribed messages arrive wrapped in a sentinel
                     # so only genuine STT output gets the voice prefix (#65827).
@@ -21215,7 +21363,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     app.invalidate()  # Refresh status line
 
                     try:
-                        self.chat(user_input, images=submit_images or None, voice_input=is_voice_input)
+                        self._chat_with_terminal_acceptance(
+                            user_input, durable_completion,
+                            images=submit_images or None, voice_input=is_voice_input,
+                        )
                     finally:
                         self._agent_running = False
                         self._spinner_text = ""
