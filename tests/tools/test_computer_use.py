@@ -1320,6 +1320,38 @@ class TestCuaDriverSessionReconnect:
         assert bridge.calls[1][0] == ("call", "list_apps", {})
         assert len(bridge.calls) == 2
 
+    def test_call_tool_reconnects_once_after_legacy_connection_closed(self):
+        """Legacy stdio may collapse EOF into RuntimeError('Connection closed')."""
+
+        class FakeBridge:
+            def __init__(self):
+                self.calls = []
+                self.effects = [RuntimeError("Connection closed"), {"ok": True}]
+
+            def run(self, value, timeout=None):
+                self.calls.append((value, timeout))
+                effect = self.effects.pop(0)
+                if isinstance(effect, Exception):
+                    raise effect
+                return effect
+
+        bridge = FakeBridge()
+        session = self._make_session(bridge)
+
+        assert session.call_tool("list_windows", {}) == {"ok": True}
+        assert session._reconnect_log == ["stop", "start"]
+        assert [call[0] for call in bridge.calls] == [
+            ("call", "list_windows", {}),
+            ("call", "list_windows", {}),
+        ]
+
+    def test_closed_session_classifier_does_not_match_unrelated_closed_error(self):
+        from tools.computer_use.cua_backend import _CuaDriverSession
+
+        assert not _CuaDriverSession._is_closed_session_error(
+            RuntimeError("Target window closed")
+        )
+
     def test_mutation_is_not_replayed_after_closed_transport(self):
         """A lost response cannot prove whether a click already happened."""
         from anyio import ClosedResourceError

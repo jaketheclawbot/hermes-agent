@@ -2149,10 +2149,21 @@ class _CuaDriverSession:
         """Return True for MCP/stdio failures that are recoverable by reconnecting."""
         name = exc.__class__.__name__
         module = getattr(exc.__class__, "__module__", "")
+        # mcp/anyio normally preserve a typed ClosedResourceError, but the
+        # legacy 0.7.1 stdio bridge can collapse EOF into a plain MCP/runtime
+        # exception whose only stable signal is this exact transport message.
+        # Keep the match narrow: arbitrary errors containing "closed" may be
+        # application/tool failures rather than a dead MCP channel.
+        message = str(exc).strip().lower()
         return (
             name in {"ClosedResourceError", "BrokenResourceError", "EndOfStream"}
             or (module.startswith("anyio") and "Resource" in name)
             or isinstance(exc, (BrokenPipeError, EOFError))
+            or message in {
+                "connection closed",
+                "connection is closed",
+                "connection was closed",
+            }
         )
 
     @staticmethod
