@@ -1119,8 +1119,9 @@ class DiscordAdapter(BasePlatformAdapter):
     # produce tens of thousands of characters — without a cap the adapter
     # posts every 2000-char chunk back-to-back and floods the channel (the
     # incident delivered 60,698 chars as 31 messages).  Chunks beyond the
-    # cap are replaced by a short notice.
-    MAX_SPLIT_MESSAGES = 8
+    # cap are replaced by a short notice.  Twenty preserves long, deliberate
+    # answers while still preventing the original 31-message flood class.
+    MAX_SPLIT_MESSAGES = 20
 
     # Auto-disconnect from voice channel after this many seconds of inactivity.
     # Config key: discord.voice_channel_inactivity_timeout_seconds (0 disables)
