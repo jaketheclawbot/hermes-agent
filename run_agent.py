@@ -9921,6 +9921,19 @@ class AIAgent:
                         reset_conversation_context(token)
                     if affinity_token is not None:
                         reset_affinity_scope(affinity_token)
+                    # Computer Use and native UI AppleScript share one physical
+                    # desktop. Ownership spans the whole agent turn (not one
+                    # click) and is released on every success/error/interrupt.
+                    try:
+                        from tools.computer_use.desktop_lease import release_desktop
+
+                        release_desktop(session_id)
+                    except Exception:
+                        logger.debug(
+                            "Failed to release shared desktop lease for %s",
+                            session_id,
+                            exc_info=True,
+                        )
                     # Balance the note_turn_started above — every exit path
                     # lands here, so the idle queue's live-turn count cannot
                     # leak upward and starve deferred reviews.

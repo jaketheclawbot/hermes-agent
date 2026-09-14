@@ -2484,6 +2484,17 @@ def _execute_code_handler(args: dict, **kwargs) -> str:
             "execute_code(code=\"...\")."
         )
 
+    # execute_code can invoke osascript through subprocess just as terminal
+    # can. Keep the common literal native-UI route under the same desktop
+    # lease; opaque/generated subprocess commands remain outside this narrow
+    # guard and should use the normal terminal path instead.
+    if "osascript" in (code or "").lower() or "system events" in (code or "").lower():
+        from tools.computer_use.desktop_lease import acquire_desktop
+
+        desktop_lease = acquire_desktop(str(kwargs.get("session_id") or ""))
+        if not desktop_lease.get("ok"):
+            return json.dumps(desktop_lease, ensure_ascii=False)
+
     return execute_code(
         code=code or "",
         task_id=kwargs.get("task_id"),

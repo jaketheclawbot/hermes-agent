@@ -553,6 +553,15 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
             "code": "bring_to_front_requires_foreground",
         })
 
+    # One physical desktop is shared by every Hermes session and process.
+    # Claim it before approvals/backends so a competing session cannot even
+    # start a second UI workflow while the owner is reasoning between calls.
+    from tools.computer_use.desktop_lease import acquire_desktop
+
+    desktop_lease = acquire_desktop(session_id)
+    if not desktop_lease.get("ok"):
+        return json.dumps(desktop_lease, ensure_ascii=False)
+
     # Approval gate (destructive actions only).
     if action in _DESTRUCTIVE_ACTIONS:
         err = _request_approval(action, args, session_id)

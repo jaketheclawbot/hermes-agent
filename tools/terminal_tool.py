@@ -4298,6 +4298,24 @@ def _handle_terminal(args, **kw):
             "command in 'command'. Use execute_code(code=...) for Python; "
             "for shell, retry as terminal(command=...)."
         )
+    # Native-picker AppleScript is desktop input too. Route direct osascript
+    # commands through the same exclusive turn lease as computer_use so a
+    # session cannot bypass coordination merely by switching tools.
+    from tools.computer_use.desktop_lease import (
+        acquire_desktop,
+        command_uses_desktop_automation,
+    )
+
+    if command_uses_desktop_automation(args.get("command", "")):
+        if args.get("background", False):
+            return tool_error(
+                "Desktop AppleScript cannot run in the background because the "
+                "shared desktop lease ends with this agent turn. Run it in the "
+                "foreground so ownership covers the whole UI action."
+            )
+        desktop_lease = acquire_desktop(str(kw.get("session_id") or ""))
+        if not desktop_lease.get("ok"):
+            return json.dumps(desktop_lease, ensure_ascii=False)
     # `notify` is the advertised interface: true → notify_on_complete,
     # ['pat', ...] → watch_patterns. The legacy args remain accepted
     # (old transcripts, internal callers); explicit `notify` wins.

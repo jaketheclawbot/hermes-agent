@@ -347,11 +347,12 @@ def test_concurrent_hermes_sessions_do_not_share_backend_state():
             )
         )["apps"][0]["marker"]
 
-    with patch("tools.computer_use.cua_backend.CuaDriverBackend", _Backend):
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            markers = list(
-                executor.map(invoke, ["conversation-a", "conversation-b"] * 4)
-            )
+    with patch("tools.computer_use.desktop_lease.acquire_desktop", return_value={"ok": True}):
+        with patch("tools.computer_use.cua_backend.CuaDriverBackend", _Backend):
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                markers = list(
+                    executor.map(invoke, ["conversation-a", "conversation-b"] * 4)
+                )
 
     assert set(markers[0::2]).isdisjoint(set(markers[1::2]))
     assert len(set(markers[0::2])) == 1
