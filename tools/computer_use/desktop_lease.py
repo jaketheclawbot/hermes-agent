@@ -105,32 +105,53 @@ def _label(session_id: str) -> str:
         return session_id[:160]
 
 
-def acquire_desktop(session_id: str, *, now: float | None = None) -> Dict[str, Any]:
-    """Claim or refresh the desktop; return a structured busy result on conflict."""
+def acquire_desktop(
+    session_id: str,
+    *,
+    now: float | None = None,
+    wait_seconds: float = 0,
+) -> Dict[str, Any]:
+    """Claim the desktop, optionally waiting in FIFO order for its release."""
     owner_id = str(session_id or "").strip() or f"pid:{os.getpid()}"
-    stamp = time.time() if now is None else float(now)
     state_path, guard_path = _paths()
-    with _guard(guard_path):
-        state = _read(state_path)
-        if state.get("_invalid"):
-            return {
-                "ok": False,
-                "code": "desktop_coordinator_unavailable",
-                "error": "Shared desktop lease state is unreadable; refusing UI input.",
-                "hint": "Repair the lease state before retrying; do not bypass it.",
-            }
-        owner = state.get("owner") if isinstance(state.get("owner"), dict) else None
-        if owner and (
-            float(owner.get("expires_at") or 0) <= stamp
-            or not _pid_alive(owner.get("pid"))
-        ):
-            owner = None
-        queue = [
-            item for item in state.get("queue", [])
-            if isinstance(item, dict)
-            and stamp - float(item.get("queued_at") or 0) < _LEASE_SECONDS
-        ]
-        if owner and owner.get("session_id") != owner_id:
+    deadline = time.monotonic() + max(0.0, float(wait_seconds))
+    while True:
+        stamp = time.time() if now is None else float(now)
+        with _guard(guard_path):
+            state = _read(state_path)
+            if state.get("_invalid"):
+                return {
+                    "ok": False,
+                    "code": "desktop_coordinator_unavailable",
+                    "error": "Shared desktop lease state is unreadable; refusing UI input.",
+                    "hint": "Repair the lease state before retrying; do not bypass it.",
+                }
+            owner = state.get("owner") if isinstance(state.get("owner"), dict) else None
+            if owner and (
+                float(owner.get("expires_at") or 0) <= stamp
+                or not _pid_alive(owner.get("pid"))
+            ):
+                owner = None
+            queue = [
+                item for item in state.get("queue", [])
+                if isinstance(item, dict)
+                and stamp - float(item.get("queued_at") or 0) < _LEASE_SECONDS
+            ]
+            blocked = bool(
+                (owner and owner.get("session_id") != owner_id)
+                or (not owner and queue and queue[0].get("session_id") != owner_id)
+            )
+            if not blocked:
+                queue = [item for item in queue if item.get("session_id") != owner_id]
+                owner = {
+                    "session_id": owner_id,
+                    "label": _label(owner_id),
+                    "pid": os.getpid(),
+                    "acquired_at": (owner or {}).get("acquired_at", stamp),
+                    "expires_at": stamp + _LEASE_SECONDS,
+                }
+                _write(state_path, {"owner": owner, "queue": queue})
+                return {"ok": True, "owner": owner_id}
             if not any(item.get("session_id") == owner_id for item in queue):
                 queue.append({
                     "session_id": owner_id,
@@ -143,27 +164,20 @@ def acquire_desktop(session_id: str, *, now: float | None = None) -> Dict[str, A
                 i for i, item in enumerate(queue, 1)
                 if item.get("session_id") == owner_id
             )
-            return {
+            busy = {
                 "ok": False,
                 "code": "desktop_busy",
-                "error": "Shared desktop is owned by another Hermes session.",
-                "owner": owner.get("label") or owner.get("session_id"),
+                "error": "Shared desktop is owned or reserved by another Hermes session.",
+                "owner": (owner or queue[0]).get("label") or (owner or queue[0]).get("session_id"),
                 "queue_position": position,
                 "hint": (
                     "No desktop action was executed. Continue non-desktop work; "
                     "retry computer_use later after the owning turn finishes."
                 ),
             }
-        queue = [item for item in queue if item.get("session_id") != owner_id]
-        owner = {
-            "session_id": owner_id,
-            "label": _label(owner_id),
-            "pid": os.getpid(),
-            "acquired_at": (owner or {}).get("acquired_at", stamp),
-            "expires_at": stamp + _LEASE_SECONDS,
-        }
-        _write(state_path, {"owner": owner, "queue": queue})
-        return {"ok": True, "owner": owner_id}
+        if time.monotonic() >= deadline:
+            return busy
+        time.sleep(0.2)
 
 
 def release_desktop(session_id: str) -> bool:

@@ -1,4 +1,5 @@
 import json
+import time
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 
@@ -23,7 +24,7 @@ def test_second_session_is_queued_and_cannot_take_desktop(lease_home):
     assert busy == {
         "ok": False,
         "code": "desktop_busy",
-        "error": "Shared desktop is owned by another Hermes session.",
+        "error": "Shared desktop is owned or reserved by another Hermes session.",
         "owner": "owner",
         "queue_position": 1,
         "hint": (
@@ -49,6 +50,18 @@ def test_simultaneous_gateway_threads_cannot_both_acquire(lease_home):
     assert {result.get("code") for result in results if not result["ok"]} == {
         "desktop_busy"
     }
+
+
+def test_waiting_session_runs_automatically_after_owner_releases(lease_home):
+    desktop_lease.acquire_desktop("owner")
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        waiting = pool.submit(
+            desktop_lease.acquire_desktop, "waiter", wait_seconds=2
+        )
+        time.sleep(0.3)
+        assert not waiting.done()
+        desktop_lease.release_desktop("owner")
+        assert waiting.result(timeout=2)["ok"] is True
 
 
 def test_owner_is_reentrant_then_release_allows_waiter(lease_home):
@@ -122,7 +135,7 @@ def test_computer_use_busy_fails_before_backend(monkeypatch):
     monkeypatch.setattr(
         desktop_lease,
         "acquire_desktop",
-        lambda _sid: {"ok": False, "code": "desktop_busy", "owner": "another"},
+        lambda _sid, **_kw: {"ok": False, "code": "desktop_busy", "owner": "another"},
     )
     monkeypatch.setattr(tool, "_get_backend", lambda **_kw: pytest.fail("backend started"))
 
@@ -136,7 +149,7 @@ def test_terminal_osascript_busy_never_executes(monkeypatch):
     monkeypatch.setattr(
         desktop_lease,
         "acquire_desktop",
-        lambda _sid: {"ok": False, "code": "desktop_busy", "owner": "another"},
+        lambda _sid, **_kw: {"ok": False, "code": "desktop_busy", "owner": "another"},
     )
     monkeypatch.setattr(terminal_tool, "terminal_tool", lambda **_kw: pytest.fail("executed"))
 
@@ -163,7 +176,7 @@ def test_execute_code_osascript_busy_never_executes(monkeypatch):
     monkeypatch.setattr(
         desktop_lease,
         "acquire_desktop",
-        lambda _sid: {"ok": False, "code": "desktop_busy", "owner": "another"},
+        lambda _sid, **_kw: {"ok": False, "code": "desktop_busy", "owner": "another"},
     )
     monkeypatch.setattr(code_execution_tool, "execute_code", lambda **_kw: pytest.fail("executed"))
 

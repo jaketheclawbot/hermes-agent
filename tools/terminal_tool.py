@@ -4313,7 +4313,9 @@ def _handle_terminal(args, **kw):
                 "shared desktop lease ends with this agent turn. Run it in the "
                 "foreground so ownership covers the whole UI action."
             )
-        desktop_lease = acquire_desktop(str(kw.get("session_id") or ""))
+        desktop_lease = acquire_desktop(
+            str(kw.get("session_id") or ""), wait_seconds=180
+        )
         if not desktop_lease.get("ok"):
             return json.dumps(desktop_lease, ensure_ascii=False)
     # `notify` is the advertised interface: true → notify_on_complete,
