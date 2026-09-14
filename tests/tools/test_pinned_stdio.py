@@ -20,6 +20,17 @@ def test_exact_receipt(receipt):
     cfg, cmd = receipt
     assert enabled(cfg, 'unrestricted', cmd)
 
+
+def test_receipt_command_is_default_resolver_target(receipt, monkeypatch):
+    cfg, cmd = receipt
+    from pathlib import Path
+
+    Path(cmd).chmod(0o755)
+    monkeypatch.delenv("HERMES_CUA_DRIVER_CMD", raising=False)
+    with patch.object(backend, "_computer_use_cfg", return_value=cfg):
+        assert backend.resolve_cua_driver_cmd() == cmd
+
+
 @pytest.mark.parametrize('mode', ['standard', 'bounded'])
 def test_never_drops_scoped_authorization(receipt, mode):
     cfg, cmd = receipt

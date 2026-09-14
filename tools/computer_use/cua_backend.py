@@ -1140,8 +1140,10 @@ def _candidate_cua_driver_commands(override: Optional[str] = None) -> List[str]:
     """Return candidate cua-driver commands in resolution order.
 
     ``override`` is authoritative when supplied. Otherwise a non-empty
-    ``HERMES_CUA_DRIVER_CMD`` is authoritative; only when neither is set do we
-    use PATH and canonical install locations.
+    ``HERMES_CUA_DRIVER_CMD`` is authoritative. When neither is set, an
+    explicitly approved ``pinned_stdio_transport.command`` is authoritative;
+    only without any explicit target do we use PATH and canonical install
+    locations.
 
     Desktop apps launched from Finder/Dock often inherit a narrow PATH that
     omits user-local install directories. The upstream cua-driver installer
@@ -1154,6 +1156,15 @@ def _candidate_cua_driver_commands(override: Optional[str] = None) -> List[str]:
         # An explicit override is authoritative: if it is wrong, report the
         # driver missing instead of silently picking a different binary.
         return [configured]
+
+    receipt = _computer_use_cfg().get("pinned_stdio_transport")
+    if isinstance(receipt, dict):
+        approved = receipt.get("command")
+        if isinstance(approved, str) and approved.strip():
+            # The receipt is an explicit artifact selection, not only a later
+            # integrity check. Resolve exactly that command so ambient PATH
+            # discovery cannot select an unrelated installed driver first.
+            return [approved.strip()]
 
     candidates = [_CUA_DRIVER_DEFAULT_CMD]
     home = os.path.expanduser("~")
