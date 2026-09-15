@@ -4314,7 +4314,7 @@ def _handle_terminal(args, **kw):
                 "foreground so ownership covers the whole UI action."
             )
         desktop_lease = acquire_desktop(
-            str(kw.get("session_id") or ""), wait_seconds=180
+            str(kw.get("session_id") or ""), park=True
         )
         if not desktop_lease.get("ok"):
             return json.dumps(desktop_lease, ensure_ascii=False)

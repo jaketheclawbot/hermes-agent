@@ -11625,6 +11625,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if getattr(event, "internal", False):
             return False
 
+        # Any real user input supersedes a previously parked desktop action,
+        # including steer/redirect messages that never become a separate turn.
+        try:
+            from tools.computer_use.desktop_lease import cancel_desktop_wait
+
+            await asyncio.to_thread(cancel_desktop_wait, session_key)
+        except Exception:
+            logger.debug(
+                "Failed to cancel superseded busy desktop wait for %s",
+                session_key,
+                exc_info=True,
+            )
+
         _busy_state = self._peek_session_state(session_key)
         running_agent = _busy_state.turn.agent if _busy_state else None
 
@@ -15222,6 +15235,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # destination platform's home channel, then forges a synthetic user
         # turn so the agent kicks off the new chat.
         self._spawn_supervised(self._handoff_watcher, "handoff_watcher")
+
+        # Start background desktop-wait watcher — parked Computer Use calls are
+        # persisted in the machine-wide lease file and wake their originating
+        # gateway session only when the desktop is actually available. Local
+        # owner release signals it immediately; the one-second timeout is only
+        # the cross-process/restart recovery fallback.
+        from tools.computer_use.desktop_lease import set_desktop_wait_notifier
+
+        self._desktop_wait_signal = asyncio.Event()
+        _desktop_wait_loop = asyncio.get_running_loop()
+        set_desktop_wait_notifier(
+            lambda: _desktop_wait_loop.call_soon_threadsafe(self._desktop_wait_signal.set)
+        )
+        self._spawn_supervised(self._desktop_wait_watcher, "desktop_wait_watcher")
 
         # Start background async-delegation watcher — drains completion events
         # from delegate_task(background=true) subagents and injects each
@@ -23628,6 +23655,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if _vc_note:
             turn_sidecar_notes.append(_vc_note)
 
+        # A newer real user turn supersedes any parked desktop request from the
+        # same durable session. Synthetic desktop-ready wakes are internal and
+        # deliberately keep their queue row until the resumed tool call claims it.
+        if not getattr(event, "internal", False):
+            try:
+                from tools.computer_use.desktop_lease import cancel_desktop_wait
+
+                await asyncio.to_thread(
+                    cancel_desktop_wait, session_entry.session_id
+                )
+            except Exception:
+                logger.debug(
+                    "Could not cancel superseded desktop wait for %s",
+                    session_entry.session_id,
+                    exc_info=True,
+                )
+
         # -----------------------------------------------------------------
         # Auto-analyze images sent by the user
         #
@@ -28944,7 +28988,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message_id=str(evt.get("message_id") or "").strip() or None,
                 metadata=metadata,
             )
-            synth_event._require_turn_acceptance = evt.get("type") in {"completion", "async_delegation"}
+            synth_event._require_turn_acceptance = evt.get("type") in {
+                "completion",
+                "async_delegation",
+                "desktop_wait_ready",
+            }
             logger.info(
                 "Watch pattern notification — injecting for %s chat=%s thread=%s",
                 platform_name,
@@ -29574,6 +29622,88 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     for evt, _claim_id in siblings:
                         _pr.completion_queue.put(evt)
         return delivered
+
+    async def _desktop_wait_watcher(self, interval: float = 1.0) -> None:
+        """Wake parked desktop turns or report their three-hour expiry."""
+        from tools.computer_use.desktop_lease import (
+            claim_desktop_wait_events,
+            complete_desktop_wait_event,
+            discard_desktop_wait,
+        )
+
+        consumer_id = f"gateway:{os.getpid()}:{id(self)}"
+        while self._running:
+            events = await asyncio.to_thread(
+                claim_desktop_wait_events, consumer_id
+            )
+            for evt in events:
+                delivered = False
+                parent_session_id = str(evt.get("parent_session_id") or "").strip()
+                if parent_session_id:
+                    verdict = await self._classify_completion_target(parent_session_id)
+                    if verdict == "terminal":
+                        await asyncio.to_thread(
+                            discard_desktop_wait,
+                            str(evt.get("wait_id") or ""),
+                        )
+                        continue
+                    if verdict == "retry":
+                        await asyncio.to_thread(
+                            complete_desktop_wait_event,
+                            str(evt.get("wait_id") or ""),
+                            str(evt.get("claim_id") or ""),
+                            delivered=False,
+                        )
+                        continue
+                try:
+                    if evt.get("type") == "desktop_wait_ready":
+                        synth_text = (
+                            "[IMPORTANT: The shared desktop is now available for your "
+                            "parked Computer Use request. Re-read the latest user messages "
+                            "before acting. If the request was superseded or cancelled, do "
+                            "not execute stale UI work. Otherwise resume the original task "
+                            "now by retrying the previously blocked desktop action. Do not "
+                            "send a mere status update; continue through verified completion.]"
+                        )
+                        delivered = bool(
+                            await self._inject_watch_notification(synth_text, evt)
+                        )
+                    else:
+                        source = await asyncio.to_thread(
+                            self._build_process_event_source, evt
+                        )
+                        adapter = self._adapter_for_source(source) if source else None
+                        if source and adapter:
+                            result = await adapter.send(
+                                source.chat_id,
+                                "⚠️ The queued Computer Use request expired after waiting "
+                                "three hours for the shared desktop. No desktop action was "
+                                "executed. If the task is still wanted, send a new message "
+                                "in this thread to queue it again.",
+                                metadata=self._thread_metadata_for_source(source),
+                            )
+                            delivered = bool(getattr(result, "success", False))
+                except Exception:
+                    logger.exception(
+                        "Desktop wait event delivery failed: wait_id=%s type=%s",
+                        evt.get("wait_id"), evt.get("type"),
+                    )
+                await asyncio.to_thread(
+                    complete_desktop_wait_event,
+                    str(evt.get("wait_id") or ""),
+                    str(evt.get("claim_id") or ""),
+                    delivered=delivered,
+                )
+            signal = getattr(self, "_desktop_wait_signal", None)
+            if signal is None:
+                await asyncio.sleep(interval)
+                continue
+            try:
+                await asyncio.wait_for(signal.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                pass
+            finally:
+                signal.clear()
 
     async def _async_delegation_watcher(self, interval: float = 2.0) -> None:
         """Drain async-delegation completions and inject them as new turns.
@@ -33482,6 +33612,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             session_key or "?",
                             exc_info=True,
                         )
+                    if not getattr(pending_event, "internal", False):
+                        try:
+                            from tools.computer_use.desktop_lease import cancel_desktop_wait
+
+                            await asyncio.to_thread(cancel_desktop_wait, session_id)
+                        except Exception:
+                            logger.debug(
+                                "Failed to cancel superseded queued desktop wait for %s",
+                                session_id,
+                                exc_info=True,
+                            )
                     next_message = await self._prepare_profile_scoped_inbound_message_text(
                         event=pending_event,
                         source=next_source,

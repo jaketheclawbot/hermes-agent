@@ -208,10 +208,15 @@ class TestBusySessionAck:
         agent.steer = MagicMock(return_value=True)
         runner._running_agents[sk] = agent
 
-        with patch("gateway.run.merge_pending_message_event") as mock_merge:
+        with (
+            patch("gateway.run.merge_pending_message_event") as mock_merge,
+            patch("tools.computer_use.desktop_lease.cancel_desktop_wait") as cancel_wait,
+        ):
             await runner._handle_active_session_busy_message(event, sk)
 
-        # VERIFY: Agent was steered, NOT interrupted
+        # VERIFY: Agent was steered, NOT interrupted, and stale parked UI work
+        # was cancelled even though this steer never becomes a separate turn.
+        cancel_wait.assert_called_once_with(sk)
         agent.steer.assert_called_once_with("also check the tests")
         agent.interrupt.assert_not_called()
 

@@ -2492,7 +2492,7 @@ def _execute_code_handler(args: dict, **kwargs) -> str:
         from tools.computer_use.desktop_lease import acquire_desktop
 
         desktop_lease = acquire_desktop(
-            str(kwargs.get("session_id") or ""), wait_seconds=180
+            str(kwargs.get("session_id") or ""), park=True
         )
         if not desktop_lease.get("ok"):
             return json.dumps(desktop_lease, ensure_ascii=False)

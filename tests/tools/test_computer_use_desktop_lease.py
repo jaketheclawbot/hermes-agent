@@ -64,6 +64,145 @@ def test_waiting_session_runs_automatically_after_owner_releases(lease_home):
         assert waiting.result(timeout=2)["ok"] is True
 
 
+def test_parked_wait_is_durable_for_three_hours_and_preserved_on_turn_exit(
+    lease_home, monkeypatch
+):
+    desktop_lease.acquire_desktop("owner", now=100)
+    monkeypatch.setattr(
+        desktop_lease,
+        "_routing",
+        lambda sid: {
+            "platform": "discord",
+            "chat_id": "thread-1",
+            "chat_type": "thread",
+            "thread_id": "thread-1",
+            "session_key": "agent:main:discord:thread:thread-1:thread-1",
+            "parent_session_id": sid,
+        },
+    )
+
+    parked = desktop_lease.acquire_desktop("waiter", now=101, park=True)
+
+    assert parked["code"] == "desktop_parked"
+    assert parked["expires_in_seconds"] == 10800
+    assert parked["queue_position"] == 1
+    desktop_lease.release_desktop("waiter")
+    state = json.loads(lease_home.read_text())
+    assert state["queue"][0]["session_id"] == "waiter"
+    assert state["queue"][0]["expires_at"] == 101 + 10800
+    assert state["queue"][0]["thread_id"] == "thread-1"
+
+
+def test_ready_event_is_claimed_once_and_waiter_acquires_after_wake(lease_home):
+    desktop_lease.acquire_desktop("owner", now=100)
+    parked = desktop_lease.acquire_desktop("waiter", now=101, park=True)
+    desktop_lease.release_desktop("owner")
+
+    events = desktop_lease.claim_desktop_wait_events("gateway-a", now=102)
+    assert len(events) == 1
+    event = events[0]
+    assert event["type"] == "desktop_wait_ready"
+    assert event["kind"] == "ready"
+    assert event["wait_id"] == parked["wait_id"]
+    assert desktop_lease.claim_desktop_wait_events("gateway-b", now=102) == []
+
+    assert desktop_lease.complete_desktop_wait_event(
+        event["wait_id"], event["claim_id"], delivered=True, now=103
+    )
+    assert desktop_lease.acquire_desktop("waiter", now=104)["ok"] is True
+    assert json.loads(lease_home.read_text())["queue"] == []
+
+
+def test_failed_ready_delivery_releases_claim_for_retry(lease_home):
+    desktop_lease.acquire_desktop("owner", now=100)
+    desktop_lease.acquire_desktop("waiter", now=101, park=True)
+    desktop_lease.release_desktop("owner")
+    event = desktop_lease.claim_desktop_wait_events("gateway-a", now=102)[0]
+
+    assert desktop_lease.complete_desktop_wait_event(
+        event["wait_id"], event["claim_id"], delivered=False, now=103
+    )
+    retried = desktop_lease.claim_desktop_wait_events("gateway-b", now=104)
+    assert len(retried) == 1
+    assert retried[0]["wait_id"] == event["wait_id"]
+    assert retried[0]["claim_id"] != event["claim_id"]
+
+
+def test_expiry_event_is_retained_until_delivery_then_removed(lease_home):
+    desktop_lease.acquire_desktop("owner", now=100)
+    parked = desktop_lease.acquire_desktop("waiter", now=101, park=True)
+
+    event = desktop_lease.claim_desktop_wait_events(
+        "gateway-a", now=101 + desktop_lease._WAIT_SECONDS + 1
+    )[0]
+    assert event["type"] == "desktop_wait_expired"
+    assert json.loads(lease_home.read_text())["queue"]
+
+    assert desktop_lease.complete_desktop_wait_event(
+        parked["wait_id"], event["claim_id"], delivered=True, now=20000
+    )
+    assert json.loads(lease_home.read_text())["queue"] == []
+
+
+def test_ready_wake_that_never_acquires_still_emits_expiry(lease_home):
+    desktop_lease.acquire_desktop("owner", now=100)
+    parked = desktop_lease.acquire_desktop("waiter", now=101, park=True)
+    desktop_lease.release_desktop("owner")
+    ready = desktop_lease.claim_desktop_wait_events("gateway-a", now=102)[0]
+    desktop_lease.complete_desktop_wait_event(
+        parked["wait_id"], ready["claim_id"], delivered=True, now=103
+    )
+
+    expired = desktop_lease.claim_desktop_wait_events(
+        "gateway-b", now=101 + desktop_lease._WAIT_SECONDS + 1
+    )
+    assert len(expired) == 1
+    assert expired[0]["type"] == "desktop_wait_expired"
+
+
+def test_expired_parked_wait_is_not_pruned_before_notice_delivery(lease_home):
+    desktop_lease.acquire_desktop("owner", now=100)
+    desktop_lease.acquire_desktop("waiter", now=101, park=True)
+    desktop_lease.release_desktop("owner")
+
+    later = 101 + desktop_lease._WAIT_SECONDS + 1
+    blocked = desktop_lease.acquire_desktop("newcomer", now=later)
+    assert blocked["code"] == "desktop_busy"
+    state = json.loads(lease_home.read_text())
+    assert [item["session_id"] for item in state["queue"]] == ["waiter", "newcomer"]
+
+
+def test_release_wakes_local_gateway_monitor(lease_home):
+    signals = []
+    desktop_lease.set_desktop_wait_notifier(lambda: signals.append("wake"))
+    try:
+        desktop_lease.acquire_desktop("owner", now=100)
+        desktop_lease.acquire_desktop("waiter", now=101, park=True)
+        signals.clear()
+        desktop_lease.release_desktop("owner")
+        assert signals == ["wake"]
+    finally:
+        desktop_lease.set_desktop_wait_notifier(None)
+
+
+def test_new_user_turn_cancels_parked_wait(lease_home, monkeypatch):
+    monkeypatch.setattr(
+        desktop_lease,
+        "_routing",
+        lambda session_id: {
+            "session_key": "discord:thread:queued",
+            "parent_session_id": session_id,
+            "origin_session_id": session_id,
+        },
+    )
+    desktop_lease.acquire_desktop("owner", now=100)
+    desktop_lease.acquire_desktop("waiter", now=101, park=True)
+
+    assert desktop_lease.cancel_desktop_wait("discord:thread:queued") is True
+    assert desktop_lease.cancel_desktop_wait("waiter") is False
+    assert json.loads(lease_home.read_text())["queue"] == []
+
+
 def test_owner_is_reentrant_then_release_allows_waiter(lease_home):
     first = desktop_lease.acquire_desktop("owner", now=100)
     refreshed = desktop_lease.acquire_desktop("owner", now=200)

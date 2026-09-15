@@ -558,7 +558,7 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
     # start a second UI workflow while the owner is reasoning between calls.
     from tools.computer_use.desktop_lease import acquire_desktop
 
-    desktop_lease = acquire_desktop(session_id, wait_seconds=180)
+    desktop_lease = acquire_desktop(session_id, park=True)
     if not desktop_lease.get("ok"):
         return json.dumps(desktop_lease, ensure_ascii=False)
 
