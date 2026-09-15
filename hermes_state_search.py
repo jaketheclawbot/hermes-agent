@@ -1824,7 +1824,23 @@ class SessionSearchMixin:
                 matches, result_fields=result_fields
             )
         if not self._fts_enabled:
-            return []
+            # Gateway startup intentionally keeps all FTS read paths disabled
+            # until post-connect reconciliation completes. Canonical rows are
+            # already durable, so return an honest (slower) LIKE result rather
+            # than presenting temporary search unavailability as "no matches".
+            matches = self._search_messages_like_fallback(
+                query,
+                source_filter=source_filter,
+                exclude_sources=exclude_sources,
+                role_filter=role_filter,
+                limit=limit,
+                offset=offset,
+                sort=sort,
+                include_inactive=include_inactive,
+            )
+            return self._finalize_search_matches(
+                matches, result_fields=result_fields
+            )
 
         # Normalise sort. Anything not in the allowed set falls back to None
         # (FTS5 rank-only) so callers can pass through user input without

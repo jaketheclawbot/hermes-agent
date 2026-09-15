@@ -7783,6 +7783,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         self._provider_routing = self._load_provider_routing()
         self._fallback_model = self._load_fallback_model()
+        # Cooperative stop signal for SQLite's progress handler while the
+        # deferred indexes/data/FTS pass runs in the gateway executor.
+        self._state_db_maintenance_cancel = threading.Event()
 
         # Wire process registry into session store for reset protection.
         # A background process older than the configured threshold (default 24h,
@@ -7801,6 +7804,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             has_active_processes_fn=lambda key: process_registry.has_active_for_session(
                 key, max_active_age=_bg_max_age_seconds,
             ),
+            defer_fts_initialization=True,
         )
         # One enforced loop-side boundary for the synchronous SessionStore.
         # Sync helpers keep using ``session_store`` directly; async gateway
@@ -8065,36 +8069,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # no indication until they try /resume and find nothing (#88235).
             self._session_db_init_error = str(e)
 
-        # Opportunistic state.db maintenance: prune ended sessions inactive
-        # for sessions.retention_days + optional VACUUM. Tracks last-run
-        # in state_meta so it only actually executes once per
-        # sessions.min_interval_hours.  Gateway is long-lived so blocking
-        # a few seconds once per day is acceptable; failures are logged
-        # but never raised.
-        if self._session_db is not None:
-            try:
-                from hermes_cli.config import load_config as _load_full_config
-                _sess_cfg = (_load_full_config().get("sessions") or {})
-                # Non-destructive stale-session archive, independent of prune.
-                if _sess_cfg.get("auto_archive", False):
-                    self._session_db._db.maybe_auto_archive(
-                        idle_days=float(_sess_cfg.get("auto_archive_days", 3)),
-                        min_interval_hours=int(_sess_cfg.get("min_interval_hours", 24)),
-                    )
-                if _sess_cfg.get("auto_prune", False):
-                    # Construction-time, before the loop serves traffic; sync DB is fine.
-                    self._session_db._db.maybe_auto_prune_and_vacuum(
-                        retention_days=int(_sess_cfg.get("retention_days", 90)),
-                        min_interval_hours=int(_sess_cfg.get("min_interval_hours", 24)),
-                        min_vacuum_interval_days=int(
-                            _sess_cfg.get("min_vacuum_interval_days", 30)
-                        ),
-                        vacuum=bool(_sess_cfg.get("vacuum_after_prune", True)),
-                        sessions_dir=self.config.sessions_dir,
-                    )
-            except Exception as exc:
-                logger.debug("state.db auto-maintenance skipped: %s", exc)
-
         # Opportunistic shadow-repo cleanup — deletes stale checkpoint repos
         # under ~/.hermes/checkpoints/.  Opt-in via checkpoints.auto_prune,
         # idempotent via .last_prune marker.
@@ -8141,6 +8115,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
+        self._state_db_maintenance_task: Optional[asyncio.Task] = None
 
         # Event-loop liveness heartbeat (#66892): rewritten every 30s while
         # the loop is dispatching. External supervisors use the file mtime /
@@ -14071,6 +14046,203 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             logger.debug("Failed to start gateway loop heartbeat", exc_info=True)
 
+    @staticmethod
+    def _state_db_maintenance_config() -> dict:
+        try:
+            from hermes_cli.config import load_config as _load_full_config
+
+            return dict((_load_full_config().get("sessions") or {}))
+        except Exception:
+            return {}
+
+    def _state_db_handles_snapshot(self) -> list:
+        """Return the store-owned per-profile handles without opening a DB."""
+        store = getattr(self, "session_store", None)
+        lock = getattr(store, "_db_handles_lock", None)
+        handles = getattr(store, "_db_handles", None)
+        if lock is None or not isinstance(handles, dict):
+            return []
+        with lock:
+            return list(dict.fromkeys(handles.values()))
+
+    def _write_state_db_maintenance_status(
+        self, search_status: str, error: Optional[str] = None
+    ) -> None:
+        try:
+            from gateway.status import write_runtime_status
+
+            write_runtime_status(
+                session_store={
+                    "search_status": search_status,
+                    "maintenance_error": error,
+                }
+            )
+        except Exception:
+            pass
+
+    async def _run_state_db_maintenance(
+        self, db: Any, sessions_config: Optional[dict] = None
+    ) -> bool:
+        """Run one profile's non-readiness-critical DB work off the loop."""
+        cancel_event = self._state_db_maintenance_cancel
+        self._write_state_db_maintenance_status("running")
+        logger.info("Background state.db maintenance started for %s", db.db_path)
+
+        def _work() -> bool:
+            if getattr(db, "state_db_maintenance_pending", False):
+                if not db.run_deferred_startup_maintenance(cancel_event):
+                    return False
+            if cancel_event.is_set():
+                return False
+            cfg = sessions_config or {}
+
+            def _auto_maintenance() -> None:
+                if cfg.get("auto_archive", False):
+                    db.maybe_auto_archive(
+                        idle_days=float(cfg.get("auto_archive_days", 3)),
+                        min_interval_hours=int(cfg.get("min_interval_hours", 24)),
+                    )
+                if cancel_event.is_set():
+                    return
+                if cfg.get("auto_prune", False):
+                    db.maybe_auto_prune_and_vacuum(
+                        retention_days=int(cfg.get("retention_days", 90)),
+                        min_interval_hours=int(cfg.get("min_interval_hours", 24)),
+                        min_vacuum_interval_days=int(
+                            cfg.get("min_vacuum_interval_days", 30)
+                        ),
+                        vacuum=bool(cfg.get("vacuum_after_prune", True)),
+                        sessions_dir=self.config.sessions_dir,
+                    )
+
+            if cfg and hasattr(db, "run_cancellable_background_maintenance"):
+                return db.run_cancellable_background_maintenance(
+                    _auto_maintenance, cancel_event
+                )
+            _auto_maintenance()
+            return not cancel_event.is_set()
+
+        try:
+            completed = await self._run_in_executor_with_context(_work)
+        except asyncio.CancelledError:
+            cancel_event.set()
+            self._write_state_db_maintenance_status("cancelled")
+            logger.info("Background state.db maintenance cancellation requested")
+            raise
+        except Exception as exc:
+            self._write_state_db_maintenance_status("failed", str(exc))
+            logger.error(
+                "Background state.db maintenance failed for %s; "
+                "canonical persistence remains online and search degrades to LIKE: %s",
+                db.db_path,
+                exc,
+                exc_info=True,
+            )
+            return False
+
+        if completed:
+            self._write_state_db_maintenance_status("ok")
+            logger.info("Background state.db maintenance completed for %s", db.db_path)
+        else:
+            status = "cancelled" if cancel_event.is_set() else "pending"
+            self._write_state_db_maintenance_status(status)
+            logger.info("Background state.db maintenance remains %s for %s", status, db.db_path)
+        return completed
+
+    async def _state_db_maintenance_watcher(self) -> None:
+        """Maintain every opened profile DB, including handles opened later."""
+        sessions_config = self._state_db_maintenance_config()
+        auto_pending = bool(
+            sessions_config.get("auto_archive", False)
+            or sessions_config.get("auto_prune", False)
+        )
+        auto_done: set[int] = set()
+        multiplex = bool(getattr(self.config, "multiplex_profiles", False))
+        while self._running and not self._state_db_maintenance_cancel.is_set():
+            handles = self._state_db_handles_snapshot()
+            work_found = False
+            for db in handles:
+                needs_fts = bool(
+                    getattr(db, "state_db_maintenance_pending", False)
+                )
+                needs_auto = auto_pending and id(db) not in auto_done
+                if not needs_fts and not needs_auto:
+                    continue
+                work_found = True
+                completed = await self._run_state_db_maintenance(
+                    db, sessions_config if needs_auto else {}
+                )
+                if needs_auto and completed:
+                    auto_done.add(id(db))
+                if not completed and not self._state_db_maintenance_cancel.is_set():
+                    await self._wait_for_state_db_maintenance_cancel(5)
+            if not multiplex and not work_found:
+                return
+            await self._wait_for_state_db_maintenance_cancel(30)
+
+    async def _wait_for_state_db_maintenance_cancel(self, timeout: float) -> None:
+        """Sleep responsively without cancelling an in-flight executor future."""
+        deadline = time.monotonic() + timeout
+        while not self._state_db_maintenance_cancel.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            await asyncio.sleep(min(0.1, remaining))
+
+    async def _stop_state_db_background_maintenance(
+        self, timeout: float = _EXECUTOR_QUIESCE_TIMEOUT
+    ) -> bool:
+        """Request cooperative stop and await the worker before DB teardown.
+
+        Cancelling an asyncio task that awaits ``run_in_executor`` does not
+        stop its thread. Keep the task alive, wake SQLite's progress handler,
+        and await it explicitly. If a non-cooperative worker exceeds the
+        bound, executor quiescence below observes the live thread and skips
+        SessionDB close rather than racing it.
+        """
+        cancel_event = getattr(self, "_state_db_maintenance_cancel", None)
+        if cancel_event is None:
+            return True
+        cancel_event.set()
+        task = getattr(self, "_state_db_maintenance_task", None)
+        if task is None or task.done():
+            return True
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=max(0.0, timeout))
+            return True
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Background state.db maintenance did not quiesce within %.2fs; "
+                "the shared DB handle will remain open if its executor thread "
+                "is still live",
+                timeout,
+            )
+            return False
+
+    def _start_state_db_background_maintenance(self) -> None:
+        sessions_config = self._state_db_maintenance_config()
+        handles = self._state_db_handles_snapshot()
+        needed = any(
+            getattr(db, "state_db_maintenance_pending", False) for db in handles
+        ) or bool(
+            sessions_config.get("auto_archive", False)
+            or sessions_config.get("auto_prune", False)
+            or getattr(self.config, "multiplex_profiles", False)
+        )
+        if not needed:
+            return
+        self._write_state_db_maintenance_status("pending")
+        self._spawn_supervised(
+            self._state_db_maintenance_watcher,
+            "state_db_maintenance",
+            on_spawn=lambda task: setattr(
+                self, "_state_db_maintenance_task", task
+            ),
+            on_give_up=lambda _name: self._write_state_db_maintenance_status(
+                "failed", "background maintenance supervisor exhausted retries"
+            ),
+        )
+
     async def start(self) -> bool:
         """
         Start the gateway and all configured platform adapters.
@@ -14881,6 +15053,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._running = True
         self._install_plugin_message_injector()
         self._update_runtime_status("running")
+        self._start_state_db_background_maintenance()
 
         try:
             await self._ensure_hosted_room_worker()
@@ -17106,6 +17279,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _phase_elapsed(),
             )
 
+            # Unlike ordinary asyncio watchers, this task may be awaiting an
+            # executor thread. Cancellation would detach that thread, so ask
+            # it to stop and await it explicitly before considering DB close.
+            _stop_db_maintenance = getattr(
+                self, "_stop_state_db_background_maintenance", None
+            )
+            if callable(_stop_db_maintenance):
+                await _stop_db_maintenance()
+            _maintenance_task = getattr(
+                self, "_state_db_maintenance_task", None
+            )
             for _task in list(self._background_tasks):
                 if _task is self._stop_task:
                     continue
@@ -17114,6 +17298,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # right now; cancelling it would propagate CancelledError
                     # into this _stop_impl and skip _shutdown_event.set() /
                     # _exit_code = 75 (#12875).  It self-terminates anyway.
+                    continue
+                if _task is _maintenance_task and not _task.done():
+                    # A bounded await above timed out. Leave the task attached
+                    # so executor shutdown can see the live worker and suppress
+                    # unsafe SessionDB close/checkpoint.
                     continue
                 _task.cancel()
             self._background_tasks.clear()

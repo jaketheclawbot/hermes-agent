@@ -1269,7 +1269,7 @@ class SessionStore:
     """
     
     def __init__(self, sessions_dir: Path, config: GatewayConfig,
-                 has_active_processes_fn=None):
+                 has_active_processes_fn=None, *, defer_fts_initialization: bool = False):
         self.sessions_dir = sessions_dir
         self.config = config
         self._entries: Dict[str, SessionEntry] = {}
@@ -1307,6 +1307,7 @@ class SessionStore:
         self._transcript_append_failures: Dict[str, int] = {}
         self._fts_rebuild_attempted = False
         self._has_active_processes_fn = has_active_processes_fn
+        self._defer_fts_initialization = bool(defer_fts_initialization)
         # Whether to keep writing the legacy sessions.json mirror alongside
         # the primary gateway_routing table in state.db. Default True for
         # backward compatibility; disable via gateway.write_sessions_json.
@@ -1397,6 +1398,10 @@ class SessionStore:
                 # every long-lived in-process caller (store, runner, cron,
                 # mirror, slash commands, tools) shares ONE writer
                 # connection per path instead of each minting its own.
+                if getattr(self, "_defer_fts_initialization", False):
+                    return get_shared_session_db(
+                        path, defer_fts_initialization=True
+                    )
                 return get_shared_session_db(path)
             except RuntimeError as e:
                 if "live-system guard" in str(e):

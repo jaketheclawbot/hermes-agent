@@ -406,7 +406,7 @@ _FTS_TRIGGERS = (
 )
 
 
-SCHEMA_SQL = """
+CORE_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER NOT NULL
 );
@@ -626,7 +626,10 @@ CREATE TABLE IF NOT EXISTS async_delegations (
     delivery_claim TEXT,
     delivery_claimed_at REAL
 );
+"""
 
+
+SCHEMA_INDEX_SQL = """
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
@@ -648,6 +651,13 @@ CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(
 CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
     ON async_delegations(delivery_state, completed_at);
 """
+
+
+# Public, declarative schema source used by reconciliation/read-only probes.
+# Gateway startup may execute CORE_SCHEMA_SQL alone so index creation cannot
+# scan a large existing store before messaging is reachable; the supervised
+# maintenance pass executes this full definition after adapters are online.
+SCHEMA_SQL = CORE_SCHEMA_SQL + SCHEMA_INDEX_SQL
 
 
 # Indexes that reference columns added in later schema versions must be

@@ -1262,12 +1262,36 @@ def write_runtime_status(
         # coverage without a second probe.
         payload["served_profiles"] = list(served_profiles or [])
     if session_store is not _UNSET:
-        state = "unknown"
+        previous_store = payload.get("session_store")
+        store_payload = (
+            dict(previous_store) if isinstance(previous_store, dict) else {}
+        )
         if isinstance(session_store, dict):
-            candidate = str(session_store.get("status") or "unknown")
-            if candidate in {"ok", "unavailable", "retrying", "unknown"}:
-                state = candidate
-        payload["session_store"] = {"status": state}
+            if "status" in session_store:
+                candidate = str(session_store.get("status") or "unknown")
+                store_payload["status"] = (
+                    candidate
+                    if candidate in {"ok", "unavailable", "retrying", "unknown"}
+                    else "unknown"
+                )
+            elif "status" not in store_payload:
+                store_payload["status"] = "unknown"
+            if "search_status" in session_store:
+                candidate = session_store.get("search_status")
+                if candidate in {"pending", "running", "ok", "failed", "cancelled"}:
+                    store_payload["search_status"] = candidate
+                else:
+                    store_payload.pop("search_status", None)
+            if "maintenance_error" in session_store:
+                if session_store.get("maintenance_error"):
+                    store_payload["maintenance_error"] = str(
+                        session_store["maintenance_error"]
+                    )[:500]
+                else:
+                    store_payload.pop("maintenance_error", None)
+        else:
+            store_payload = {"status": "unknown"}
+        payload["session_store"] = store_payload
 
     if platform is not _UNSET:
         platform_payload = payload["platforms"].get(platform, {})

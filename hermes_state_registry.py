@@ -98,11 +98,15 @@ _retired: Dict[int, _Generation] = {}  # id(db) → generation
 _opening: Dict[Path, threading.Event] = {}
 
 
-def _open_session_db(path: Path) -> "SessionDB":
+def _open_session_db(
+    path: Path, *, defer_fts_initialization: bool = False
+) -> "SessionDB":
     """Construct the SessionDB for *path* (call-time import avoids cycles)."""
     from hermes_state import SessionDB
 
-    return SessionDB(db_path=path)
+    return SessionDB(
+        db_path=path, defer_fts_initialization=defer_fts_initialization
+    )
 
 
 def _teardown(db: "SessionDB") -> None:
@@ -117,12 +121,18 @@ def _teardown(db: "SessionDB") -> None:
         logger.debug("Error closing shared SessionDB", exc_info=True)
 
 
-def acquire(db_path: Optional[Path] = None) -> "SessionDB":
+def acquire(
+    db_path: Optional[Path] = None, *, defer_fts_initialization: bool = False
+) -> "SessionDB":
     """Return the shared SessionDB for *db_path*, incrementing its refcount.
 
     The same resolved path always returns the same ``SessionDB`` instance
     within one process, so all long-lived in-process callers share one
     writer connection, one ``self._lock``, and one token-writer thread.
+    Deferral is a property of that generation, not of an individual holder:
+    a normal caller borrowing a gateway-opened generation cannot initialize
+    FTS behind the supervisor, while a gateway borrowing an already-complete
+    generation does not repeat maintenance that another holder already paid.
 
     If the underlying file was replaced (different inode) since the
     shared generation was opened — e.g. by ``hermes sessions recover`` or
@@ -175,7 +185,12 @@ def acquire(db_path: Optional[Path] = None) -> "SessionDB":
     # Open a fresh generation OUTSIDE the lock.  The per-path opening marker
     # prevents redundant writer connections without serialising other files.
     try:
-        db = _open_session_db(path)
+        if defer_fts_initialization:
+            db = _open_session_db(path, defer_fts_initialization=True)
+        else:
+            # Preserve the historical one-argument seam used by registry
+            # embedders/tests when no gateway-specific deferral is requested.
+            db = _open_session_db(path)
         db._shared_registry_owned = True
         identity = _stat_db_file_identity(path)
     except BaseException:
@@ -318,8 +333,12 @@ def stats() -> Dict[str, int]:
 # Kept so call sites and tests can import either from hermes_state
 # (the historical path) or from this module directly.
 
-def get_shared_session_db(db_path: Optional[Path] = None) -> "SessionDB":
-    return acquire(db_path)
+def get_shared_session_db(
+    db_path: Optional[Path] = None, *, defer_fts_initialization: bool = False
+) -> "SessionDB":
+    return acquire(
+        db_path, defer_fts_initialization=defer_fts_initialization
+    )
 
 
 def release_shared_session_db(db: "SessionDB") -> bool:

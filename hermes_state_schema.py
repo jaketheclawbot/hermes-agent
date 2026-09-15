@@ -20,6 +20,7 @@ from typing import Dict, Optional, Sequence
 from hermes_constants import get_hermes_home
 from hermes_startup_watchdog import report_startup_progress
 from hermes_state_common import (
+    CORE_SCHEMA_SQL,
     DEFERRED_INDEX_SQL,
     FTS_CJK_STALE_KEY,
     FTS_REBUILD_DEFERRAL_KEY,
@@ -455,14 +456,13 @@ class SessionSchemaMixin:
         # already has the new predicate. A process can die after replacing the
         # view but before rebuilding/stamping; view text alone cannot prove the
         # old cron postings were purged.
-        self._run_admitted_startup_rebuild(
+        return self._run_admitted_startup_rebuild(
             cursor,
             lambda: cursor.execute(
                 "INSERT INTO messages_fts_trigram(messages_fts_trigram) "
                 "VALUES('rebuild')"
             ),
         )
-        return True
 
 
     @staticmethod
@@ -831,6 +831,7 @@ class SessionSchemaMixin:
             return False
 
         self._fts_stale = False
+        self._fts_maintenance_pending = False
         self._fts_enabled = True
         self._trigram_available = include_trigram
         logger.warning(
@@ -1218,7 +1219,11 @@ class SessionSchemaMixin:
 
         cursor = self._conn.cursor()
 
-        cursor.executescript(SCHEMA_SQL)
+        cursor.executescript(
+            CORE_SCHEMA_SQL
+            if getattr(self, "_defer_fts_initialization", False)
+            else SCHEMA_SQL
+        )
 
         # ── Declarative column reconciliation ──────────────────────────
         # Diff live tables against SCHEMA_SQL and ADD any missing columns.
@@ -1237,6 +1242,26 @@ class SessionSchemaMixin:
         # landed — the version-gated rebuild is unreachable there, #73823).
         # Same PK-rebuild constraint as gateway_routing above.
         self._heal_session_model_usage_pk(cursor)
+
+        if getattr(self, "_defer_fts_initialization", False):
+            # Gateway readiness needs canonical persistence, not search.  Stop
+            # before every potentially scanning index/data/FTS operation; the
+            # supervised post-connect pass reruns this idempotent method with
+            # deferral disabled.  Existing healthy FTS triggers deliberately
+            # remain installed so writes keep an already-good index current.
+            # Reads are gated off below, and all writes/maintenance share this
+            # handle's lock, so no caller can observe or mutate FTS midway
+            # through reconciliation.
+            self._fts_maintenance_pending = True
+            self._fts_enabled = False
+            self._trigram_available = False
+            self._fts_cjk_available = False
+            self._conn.commit()
+            logger.info(
+                "Deferred state.db indexes, data reconciliation, and FTS "
+                "initialization until gateway adapters are online"
+            )
+            return
 
         # Indexes that reference reconciler-added columns must be created
         # AFTER _reconcile_columns runs — declaring them in SCHEMA_SQL
@@ -1665,6 +1690,7 @@ class SessionSchemaMixin:
                     # it offline until its dedicated rebuild.
                     self._ensure_fts_cjk_schema(cursor)
                 else:
+                    self._fts_maintenance_pending = True
                     self._fts_enabled = False
                     self._trigram_available = False
                     self._fts_cjk_available = False
@@ -1745,7 +1771,7 @@ class SessionSchemaMixin:
 
         self._conn.commit()
 
-    def _run_admitted_startup_rebuild(self, cursor, rebuild_fn) -> None:
+    def _run_admitted_startup_rebuild(self, cursor, rebuild_fn) -> bool:
         """Run a full trigger-repair FTS rebuild under cross-process admission.
 
         ``_init_schema`` reaches here when the sync triggers were missing and
@@ -1768,7 +1794,7 @@ class SessionSchemaMixin:
         with fts_rebuild_admission(getattr(self, "db_path", None)) as admitted:
             if admitted:
                 rebuild_fn()
-                return
+                return True
         logger.warning(
             "Deferred startup FTS rebuild: another process holds the "
             "rebuild authority for this state.db; detaching FTS sync "
@@ -1784,6 +1810,8 @@ class SessionSchemaMixin:
         self._fts_enabled = False
         self._trigram_available = False
         self._fts_cjk_available = False
+        self._fts_maintenance_pending = True
+        return False
 
     def _backfill_gateway_metadata_from_sessions_json(
         self, cursor: sqlite3.Cursor

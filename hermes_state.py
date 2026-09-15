@@ -5299,15 +5299,30 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         except Exception:
             logger.debug("Could not close a SessionDB connection", exc_info=True)
 
-    def __init__(self, db_path: Path = None, read_only: bool = False):
+    def __init__(
+        self,
+        db_path: Path = None,
+        read_only: bool = False,
+        *,
+        defer_fts_initialization: bool = False,
+    ):
         self.db_path = db_path or _default_db_path()
         # Fail hard (before any connection/pragma/mkdir) if a pytest-context
         # process resolved the developer's production state.db — see the
         # live-DB test-isolation guard block near _default_db_path().
         _ensure_test_isolation(self.db_path)
         self.read_only = read_only
+        # Gateway startup establishes only the tables/columns/key shapes that
+        # durable writes require. Potentially scanning indexes, data repairs,
+        # and every FTS probe/reconciliation run after adapters are online.
+        self._defer_fts_initialization = bool(defer_fts_initialization)
+        self._fts_maintenance_pending = False
+        self._fts_maintenance_error: Optional[str] = None
 
-        self._lock = threading.Lock()
+        # Re-entrant so the supervised maintenance envelope can keep the
+        # writer connection exclusively owned while invoking established
+        # helpers that take this same lock themselves.
+        self._lock = threading.RLock()
         # Read-path split (WAL only): recall/browse queries borrow a
         # read-only connection from a bounded pool so they never queue
         # behind writer flushes on self._lock. See _read_ctx().
@@ -5670,6 +5685,99 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if not initialization_complete:
                 conn, self._conn = self._conn, None
                 self._close_connection_quietly(conn)
+
+    @property
+    def state_db_maintenance_pending(self) -> bool:
+        """Whether post-connect indexes/data/FTS initialization is pending."""
+        return bool(self._fts_maintenance_pending)
+
+    @property
+    def fts_maintenance_error(self) -> Optional[str]:
+        """Most recent deferred-FTS maintenance failure, if any."""
+        return self._fts_maintenance_error
+
+    def run_deferred_startup_maintenance(
+        self, cancel_event: Optional[threading.Event] = None
+    ) -> bool:
+        """Finish deferred non-core startup work on the shared writer handle.
+
+        A SQLite progress handler makes shutdown cooperative: interruption
+        rolls back the active statement and leaves the durable stale marker
+        for an idempotent retry. Canonical session/message rows are untouched.
+        """
+        if not self._fts_maintenance_pending:
+            return True
+        if self.read_only or self._conn is None:
+            return False
+        cancel_event = cancel_event or threading.Event()
+        with self._lock:
+            if self._conn is None or cancel_event.is_set():
+                return False
+            self._fts_maintenance_error = None
+            self._fts_maintenance_pending = False
+            previous_defer = self._defer_fts_initialization
+            self._defer_fts_initialization = False
+            self._conn.set_progress_handler(
+                lambda: 1 if cancel_event.is_set() else 0,
+                1_000,
+            )
+            try:
+                self._init_schema()
+            except sqlite3.Error as exc:
+                self._fts_maintenance_pending = True
+                self._fts_enabled = False
+                self._trigram_available = False
+                self._fts_cjk_available = False
+                if cancel_event.is_set() and "interrupt" in str(exc).lower():
+                    logger.info(
+                        "Cancelled deferred state.db startup maintenance for %s",
+                        self.db_path,
+                    )
+                    return False
+                self._fts_maintenance_error = f"{type(exc).__name__}: {exc}"
+                raise
+            except Exception as exc:
+                self._fts_maintenance_pending = True
+                self._fts_enabled = False
+                self._trigram_available = False
+                self._fts_cjk_available = False
+                self._fts_maintenance_error = f"{type(exc).__name__}: {exc}"
+                raise
+            finally:
+                self._conn.set_progress_handler(None, 0)
+                self._defer_fts_initialization = previous_defer
+            return not self._fts_maintenance_pending
+
+    def run_cancellable_background_maintenance(
+        self,
+        work: Callable[[], Any],
+        cancel_event: threading.Event,
+    ) -> bool:
+        """Run best-effort maintenance with cooperative SQLite cancellation.
+
+        Maintenance methods take their normal per-handle locks. The progress
+        callback is connection-wide, but remains inert until shutdown, after
+        adapters and active turns have drained; it is always removed before
+        SessionDB teardown.
+        """
+        if self.read_only or self._conn is None or cancel_event.is_set():
+            return False
+        with self._lock:
+            if self._conn is None or cancel_event.is_set():
+                return False
+            self._conn.set_progress_handler(
+                lambda: 1 if cancel_event.is_set() else 0,
+                1_000,
+            )
+            try:
+                work()
+                return not cancel_event.is_set()
+            except sqlite3.Error as exc:
+                if cancel_event.is_set() and "interrupt" in str(exc).lower():
+                    return False
+                raise
+            finally:
+                self._conn.set_progress_handler(None, 0)
 
     # ── Read-path split ──
 
