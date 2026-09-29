@@ -610,6 +610,21 @@ def _request_approval(action: str, args: Dict[str, Any],
     operation. State is keyed on session_id so concurrent runs don't leak
     unlocks into one another.
     """
+    # The outer Hermes approval layer owns --yolo/session-/yolo/config-off.
+    # Do not invoke the legacy interactive Computer Use callback when that
+    # canonical bypass is active: unattended gateway workers have no prompt
+    # consumer, so the callback otherwise waits until the whole tool deadline
+    # even though the outer layer already authorized the action.
+    try:
+        from tools.approval import is_approval_bypass_active_for_session
+
+        if is_approval_bypass_active_for_session(str(session_id or "")):
+            return None
+    except Exception:
+        # Fail closed into the ordinary approval path if bypass state cannot
+        # be resolved.
+        pass
+
     is_foreground = args.get("delivery_mode") == "foreground"
     scope_key = (action, "foreground" if is_foreground else "background")
     with _approval_lock:

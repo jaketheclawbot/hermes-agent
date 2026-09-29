@@ -12,6 +12,8 @@ default-allow behavior.
 
 import json
 
+from unittest.mock import patch
+
 
 def _install_backend(cu_tool):
     class _RecordingBackend:
@@ -73,3 +75,35 @@ def test_b_still_dispatches_with_default_allow():
     )
     payload = json.loads(result) if isinstance(result, str) else result
     assert not (isinstance(payload, dict) and payload.get("error"))
+
+
+def test_yolo_bypass_skips_blocking_legacy_callback():
+    """Canonical approval bypass must not enter the interactive CU callback.
+
+    Gateway/Kanban workers run without a prompt consumer. Before this guard,
+    visible input under ``--yolo`` could sit in that callback until the outer
+    tool deadline even though capture (which needs no destructive approval)
+    worked normally.
+    """
+    from tools.computer_use import tool as cu_tool
+
+    backend = _install_backend(cu_tool)
+    seen = []
+
+    def must_not_run(action, args, summary):
+        seen.append((action, args, summary))
+        raise AssertionError("interactive approval callback was invoked")
+
+    cu_tool.set_approval_callback(must_not_run)
+    with patch(
+        "tools.approval.is_approval_bypass_active_for_session",
+        return_value=True,
+    ):
+        result = cu_tool.handle_computer_use(
+            {"action": "click", "element": 3, "session_id": "yolo-session"}
+        )
+
+    payload = json.loads(result) if isinstance(result, str) else result
+    assert not (isinstance(payload, dict) and payload.get("error"))
+    assert [name for name, _ in backend.calls] == ["click"]
+    assert seen == []
