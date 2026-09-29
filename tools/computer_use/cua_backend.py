@@ -2953,9 +2953,18 @@ class CuaDriverBackend(ComputerUseBackend):
         )
 
     def _call_capture_tool(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Call a capture-stage tool and disarm state on transport or logical failure."""
+        """Call a capture-stage tool and disarm state on transport or logical failure.
+
+        ``get_window_state`` traverses the full accessibility tree and captures
+        an image. On older macOS hosts that can legitimately exceed the generic
+        30-second MCP deadline even for a small explicit window, while lighter
+        discovery calls still complete promptly. Give only this read-only
+        capture operation a bounded 90-second budget; mutations retain the
+        fail-closed default and are never replayed after a timeout.
+        """
+        timeout = 90.0 if name == "get_window_state" else 30.0
         try:
-            out = self._session.call_tool(name, args)
+            out = self._session.call_tool(name, args, timeout=timeout)
         except Exception:
             self._clear_active_target()
             raise

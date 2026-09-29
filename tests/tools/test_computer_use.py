@@ -1191,7 +1191,7 @@ def _make_cua_backend_with_windows_and_apps(
     backend = CuaDriverBackend()
     backend._session = MagicMock()
 
-    def _call_tool(name, args):
+    def _call_tool(name, args, timeout=30.0):
         if name == "list_windows":
             return {
                 "data": "",
@@ -1553,6 +1553,36 @@ class TestCuaDriverSessionReconnect:
         # tree_markdown surfaced as the data text blob with the element-count summary.
         assert "AXButton" in out["data"]
         assert "7 elements" in out["data"]
+
+class TestCaptureStageTimeoutBudget:
+    def test_get_window_state_gets_extended_read_only_budget(self):
+        from tools.computer_use.cua_backend import CuaDriverBackend
+
+        class Session:
+            def __init__(self):
+                self.calls = []
+
+            def call_tool(self, name, args, timeout=30.0):
+                self.calls.append((name, args, timeout))
+                return {"isError": False}
+
+        backend = CuaDriverBackend.__new__(CuaDriverBackend)
+        session = Session()
+        backend._session = cast(Any, session)
+        backend._active_pid = 1
+        backend._active_window_id = 2
+        backend._last_app = "Chrome"
+        backend._last_target = None
+        backend._snapshot_tokens = {}
+
+        backend._call_capture_tool("get_window_state", {"window_id": 2})
+        backend._call_capture_tool("list_windows", {"on_screen_only": True})
+
+        assert session.calls == [
+            ("get_window_state", {"window_id": 2}, 90.0),
+            ("list_windows", {"on_screen_only": True}, 30.0),
+        ]
+
 
 class TestCaptureEmptyResultClipFallback:
     """When the MCP bridge returns a degenerate/empty get_window_state result
@@ -2222,7 +2252,7 @@ class TestStructuredElementsConsumption:
             "NkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
         )
 
-        def fake_call_tool(name, args):
+        def fake_call_tool(name, args, timeout=30.0):
             if name == "list_windows":
                 return {"data": "", "images": [], "image_mime_types": [],
                         "structuredContent": windows_payload, "isError": False}
@@ -2356,7 +2386,7 @@ class TestElementTokenAttachment:
             "is_on_screen": True, "title": "", "z_index": 0,
         }]}
 
-        def fake_call_tool(name, args):
+        def fake_call_tool(name, args, timeout=30.0):
             if name == "list_windows":
                 return {"data": "", "images": [], "image_mime_types": [],
                         "structuredContent": windows_payload, "isError": False}
