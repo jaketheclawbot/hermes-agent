@@ -268,6 +268,54 @@ def test_direct_osascript_detection_is_narrow():
     )
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "ssh macbook /usr/bin/osascript -e 'return 1'",
+        "/usr/bin/ssh -T -i key user@macbook \"/usr/bin/osascript -e 'return 1'\"",
+        "FOO=bar env BAR=baz ssh -o BatchMode=yes user@macbook "
+        "\"osascript -e 'return 1'\"",
+    ],
+)
+def test_remote_ssh_osascript_does_not_use_local_desktop(command):
+    assert not desktop_lease.command_uses_desktop_automation(command)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "ssh macbook true && osascript -e 'return 1'",
+        "ssh macbook true; /usr/bin/osascript -e 'return 1'",
+        "ssh macbook true\nosascript -e 'return 1'",
+        "ssh macbook \"echo $(osascript -e 'return 1')\"",
+        "python -c \"subprocess.run(['ssh', 'macbook', 'osascript'])\"",
+    ],
+)
+def test_ambiguous_or_compound_remote_osascript_stays_guarded(command):
+    assert desktop_lease.command_uses_desktop_automation(command)
+
+
+def test_terminal_remote_ssh_osascript_does_not_acquire_local_lease(monkeypatch):
+    from tools import terminal_tool
+
+    monkeypatch.setattr(
+        desktop_lease,
+        "acquire_desktop",
+        lambda *_args, **_kwargs: pytest.fail("local desktop lease acquired"),
+    )
+    monkeypatch.setattr(
+        terminal_tool,
+        "terminal_tool",
+        lambda **_kwargs: json.dumps({"output": "GUI_AV_STARTED", "exit_code": 0}),
+    )
+
+    result = json.loads(terminal_tool._handle_terminal(
+        {"command": "ssh user@macbook \"/usr/bin/osascript -e 'return 1'\""},
+        session_id="me",
+    ))
+    assert result["output"] == "GUI_AV_STARTED"
+
+
 def test_computer_use_busy_fails_before_backend(monkeypatch):
     from tools.computer_use import tool
 

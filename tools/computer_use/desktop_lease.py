@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import threading
 import time
 import uuid
@@ -438,8 +439,79 @@ def complete_desktop_wait_event(
 
 
 _OSASCRIPT = re.compile(r"(?<![\w-])(?:[^\s'\"]*/)?osascript(?![\w-])", re.I)
+_SHELL_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*", re.S)
+
+
+def _has_local_shell_control(command: str) -> bool:
+    """Fail closed when an ssh command also contains local shell execution.
+
+    Quoted remote payloads may contain arbitrary shell syntax.  Outside single
+    quotes, however, separators and substitutions can execute on this host
+    before or after ssh and therefore must retain the local desktop lease.
+    """
+    quote = ""
+    escaped = False
+    i = 0
+    while i < len(command):
+        char = command[i]
+        if escaped:
+            escaped = False
+            i += 1
+            continue
+        if char == "\\" and quote != "'":
+            escaped = True
+            i += 1
+            continue
+        if quote:
+            if char == quote:
+                quote = ""
+            elif quote == '"' and (char == "`" or command.startswith("$(", i)):
+                return True
+            i += 1
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            i += 1
+            continue
+        if char in {";", "&", "|", "\n", "`"} or command.startswith("$(", i):
+            return True
+        i += 1
+    return bool(quote or escaped)
+
+
+def _first_shell_executable(command: str) -> str:
+    """Return the simple top-level executable, or empty on ambiguity."""
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError:
+        return ""
+    index = 0
+    while index < len(tokens) and _SHELL_ASSIGNMENT.fullmatch(tokens[index]):
+        index += 1
+    if index < len(tokens) and os.path.basename(tokens[index]) == "env":
+        index += 1
+        while index < len(tokens):
+            token = tokens[index]
+            if token == "--":
+                index += 1
+                break
+            if token.startswith("-") or _SHELL_ASSIGNMENT.fullmatch(token):
+                index += 1
+                continue
+            break
+    return os.path.basename(tokens[index]) if index < len(tokens) else ""
 
 
 def command_uses_desktop_automation(command: str) -> bool:
-    """Recognize direct AppleScript UI entrypoints that must share the lease."""
-    return bool(_OSASCRIPT.search(str(command or "")))
+    """Recognize AppleScript that executes on this host.
+
+    A top-level ssh invocation executes its payload on another machine and must
+    not consume this machine's shared-desktop lease.  Ambiguous/compound shell
+    commands remain guarded so a remote exemption cannot hide local UI work.
+    """
+    text = str(command or "")
+    if not _OSASCRIPT.search(text):
+        return False
+    if _has_local_shell_control(text):
+        return True
+    return _first_shell_executable(text) != "ssh"
