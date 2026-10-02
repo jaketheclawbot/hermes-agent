@@ -913,31 +913,8 @@ class TurnRunner:
                 "Gateway auto-title failure suppressed (not user-visible): %s: %s", task, exc,
             )
             session_id = getattr(agent, "session_id", None)
-            source = ctx.source
             runner = self._runner
-            # Native Discord only stamps auto-thread markers on the opening parent-channel event. A
-            # title retry arrives as an ordinary in-thread event; when the agent was rebuilt, there
-            # is no first-turn callback left to rename it. Recover only those immutable markers from
-            # this same thread's persisted origin, while keeping the live source's transport owner.
-            if (
-                getattr(source, "platform", None) == Platform.DISCORD
-                and getattr(source, "chat_type", None) == "thread"
-                and getattr(source, "thread_id", None)
-                and getattr(source, "delivered_via_upstream_relay", False) is not True
-                and not runner._is_discord_auto_thread_lane(source)
-            ):
-                with suppress(Exception):
-                    row = agent._session_db.get_session(session_id)
-                    origin = SessionSource.from_dict(json.loads((row or {}).get("origin_json") or "{}"))
-                    if (
-                        runner._is_discord_auto_thread_lane(origin)
-                        and str(origin.thread_id) == str(source.thread_id)
-                    ):
-                        source = replace_source(
-                            source,
-                            auto_thread_created=True,
-                            auto_thread_initial_name=origin.auto_thread_initial_name,
-                        )
+            source = runner._recover_discord_auto_thread_source(ctx.source, ctx.session_key)
             # Both lanes spend a rate-limited platform call per title, so they use the model's title
             # only (TitleCallback); renaming twice burns Discord's 2-per-10-min budget on a throwaway.
             # Relay Discord predicate is shape-only: whether the connector auto-threaded our reply is
