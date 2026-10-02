@@ -12,9 +12,8 @@ import pytest
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.run import GatewayRunner
-from hermes_state import (
-    SessionDB,
-    _default_db_path,
+from hermes_state import SessionDB, _default_db_path
+from hermes_state_registry import (
     close_shared_session_dbs,
     get_shared_session_db,
     release_shared_session_db,
@@ -43,7 +42,12 @@ class _ConnectedAdapter(BasePlatformAdapter):
 
 
 def _make_current_complete_db(db_path: Path) -> None:
-    """Match the incident shape: v30, six triggers, marker, no stale flag."""
+    """Match the current complete shape: schema/triggers aligned, no stale flag.
+
+    BE84 deliberately retires ``fts_tool_full_content_high_water``; preserving
+    the old positive assertion would recreate state that current-schema open
+    is required to remove.
+    """
     db = SessionDB(db_path)
     if not db._fts_enabled or not db._trigram_available:
         db.close()
@@ -62,7 +66,7 @@ def _make_current_complete_db(db_path: Path) -> None:
     )
     assert db._conn.execute(
         "SELECT 1 FROM state_meta WHERE key='fts_tool_full_content_high_water'"
-    ).fetchone()
+    ).fetchone() is None
     assert not db._conn.execute(
         "SELECT 1 FROM state_meta WHERE key='fts_stale'"
     ).fetchone()
@@ -124,6 +128,17 @@ async def test_adapter_connect_precedes_blocked_current_schema_fts_probe_and_wri
     assert not probe_started.is_set(), "GatewayRunner construction ran heavy FTS work"
     adapter = _ConnectedAdapter(connected)
     monkeypatch.setattr(runner, "_create_adapter", lambda *_args: adapter)
+    # Keep this contract test on the platform/DB boundary. Target main has
+    # unrelated startup warmups that may launch environment probes; they are
+    # independently covered and are forbidden by the isolated acceptance harness.
+    monkeypatch.setattr(runner, "_start_free_tier_bootstrap", lambda: None)
+    monkeypatch.setattr(runner, "_start_startup_warmup", lambda: None)
+
+    async def no_finish_wiring(_connected_count):
+        return None
+
+    monkeypatch.setattr(runner, "_start_finish_wiring", no_finish_wiring)
+    monkeypatch.setattr(runner, "_start_spawn_background_watchers", lambda: None)
 
     async def no_secondary_profiles():
         return 0
@@ -332,6 +347,14 @@ async def test_gateway_shutdown_awaits_maintenance_before_db_close(
     runner = GatewayRunner(
         GatewayConfig(platforms={}, sessions_dir=tmp_path / "sessions")
     )
+    monkeypatch.setattr(runner, "_start_free_tier_bootstrap", lambda: None)
+    monkeypatch.setattr(runner, "_start_startup_warmup", lambda: None)
+
+    async def no_finish_wiring(_connected_count):
+        return None
+
+    monkeypatch.setattr(runner, "_start_finish_wiring", no_finish_wiring)
+    monkeypatch.setattr(runner, "_start_spawn_background_watchers", lambda: None)
     fake_db = BlockingDB()
     with runner.session_store._db_handles_lock:
         runner.session_store._db_handles.clear()

@@ -1,4 +1,5 @@
 import json
+import stat
 import time
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
@@ -251,6 +252,52 @@ def test_corrupt_state_fails_closed(lease_home):
     result = desktop_lease.acquire_desktop("me", now=1)
     assert result["ok"] is False
     assert result["code"] == "desktop_coordinator_unavailable"
+
+
+def test_state_and_guard_are_owner_only(lease_home):
+    assert desktop_lease.acquire_desktop("owner", now=100)["ok"] is True
+
+    assert stat.S_IMODE(lease_home.stat().st_mode) == 0o600
+    assert stat.S_IMODE(lease_home.with_name("desktop-lease.guard").stat().st_mode) == 0o600
+
+
+def test_queue_storage_is_bounded_and_fails_closed(lease_home, monkeypatch):
+    monkeypatch.setattr(desktop_lease, "_MAX_QUEUE_ITEMS", 1)
+    assert desktop_lease.acquire_desktop("owner", now=100)["ok"] is True
+    assert desktop_lease.acquire_desktop("first", now=101, park=True)["code"] == "desktop_parked"
+
+    rejected = desktop_lease.acquire_desktop("second", now=102, park=True)
+
+    assert rejected["code"] == "desktop_coordinator_unavailable"
+    state = json.loads(lease_home.read_text())
+    assert [item["session_id"] for item in state["queue"]] == ["first"]
+
+
+def test_oversized_route_fails_closed_without_persisting_it(lease_home, monkeypatch):
+    assert desktop_lease.acquire_desktop("owner", now=100)["ok"] is True
+    monkeypatch.setattr(
+        desktop_lease,
+        "_routing",
+        lambda _sid: {"session_key": "x" * (desktop_lease._MAX_ROUTE_VALUE_CHARS + 1)},
+    )
+
+    rejected = desktop_lease.acquire_desktop("waiter", now=101, park=True)
+
+    assert rejected["code"] == "desktop_coordinator_unavailable"
+    assert json.loads(lease_home.read_text())["queue"] == []
+
+
+def test_completion_requires_exact_claim_ownership(lease_home):
+    desktop_lease.acquire_desktop("owner", now=100)
+    parked = desktop_lease.acquire_desktop("waiter", now=101, park=True)
+    desktop_lease.release_desktop("owner")
+    event = desktop_lease.claim_desktop_wait_events("gateway-a", now=102)[0]
+
+    assert desktop_lease.complete_desktop_wait_event(
+        parked["wait_id"], "desktop_claim_not_owned", delivered=True, now=103
+    ) is False
+    state = json.loads(lease_home.read_text())
+    assert state["queue"][0]["event_claim_id"] == event["claim_id"]
 
 
 def test_direct_osascript_detection_is_narrow():

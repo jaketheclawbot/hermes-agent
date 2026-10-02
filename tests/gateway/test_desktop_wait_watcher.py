@@ -112,3 +112,49 @@ async def test_desktop_wait_delivery_failure_keeps_event_retryable(monkeypatch):
     await runner._desktop_wait_watcher(interval=0)
 
     assert completed == [("desktop_wait_3", "desktop_claim_3", False)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("verdict", ["terminal", "retry"])
+async def test_desktop_wait_classification_is_fail_closed(monkeypatch, verdict):
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    event = {
+        "type": "desktop_wait_ready",
+        "wait_id": "desktop_wait_closed",
+        "claim_id": "desktop_claim_closed",
+        "parent_session_id": "session-closed",
+    }
+    completed = []
+    discarded = []
+
+    monkeypatch.setattr(
+        desktop_lease, "claim_desktop_wait_events", lambda _consumer: [event]
+    )
+    monkeypatch.setattr(
+        desktop_lease, "discard_desktop_wait",
+        lambda wait_id: discarded.append(wait_id) or True,
+    )
+
+    def complete(wait_id, claim_id, *, delivered):
+        completed.append((wait_id, claim_id, delivered))
+        return True
+
+    monkeypatch.setattr(desktop_lease, "complete_desktop_wait_event", complete)
+    runner._classify_completion_target = AsyncMock(return_value=verdict)
+    runner._inject_watch_notification = AsyncMock()
+
+    async def classify_once(parent_session_id):
+        runner._running = False
+        return verdict
+
+    runner._classify_completion_target = AsyncMock(side_effect=classify_once)
+    await runner._desktop_wait_watcher(interval=0)
+
+    runner._inject_watch_notification.assert_not_awaited()
+    if verdict == "terminal":
+        assert discarded == ["desktop_wait_closed"]
+        assert completed == []
+    else:
+        assert discarded == []
+        assert completed == [("desktop_wait_closed", "desktop_claim_closed", False)]

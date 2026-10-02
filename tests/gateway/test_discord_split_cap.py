@@ -56,6 +56,19 @@ def _huge_content(chars: int = 60_000) -> str:
 
 
 class TestCapSplitChunks:
+    def test_loaded_adapter_uses_twenty_message_contract(self):
+        adapter = _make_adapter()
+        assert DiscordAdapter.MAX_SPLIT_MESSAGES == 20
+        twenty = [f"chunk-{index}" for index in range(20)]
+        assert adapter._cap_split_chunks(twenty) == twenty
+
+        twenty_one = [*twenty, "overflow"]
+        capped = adapter._cap_split_chunks(twenty_one)
+        assert len(capped) == 20
+        assert capped[:19] == twenty[:19]
+        assert "delivery limit (20 messages)" in capped[-1]
+        assert "overflow" not in capped
+
     def test_below_cap_unchanged(self):
         adapter = _make_adapter()
         chunks = ["a", "b", "c"]
@@ -67,8 +80,7 @@ class TestCapSplitChunks:
         capped = adapter._cap_split_chunks(chunks)
         assert len(capped) == CAP
         assert capped[0] == chunks[0]
-        assert "Response truncated" in capped[-1]
-        assert "delivery limit" in capped[-1]
+        assert capped[-1] not in chunks  # last slot is the truncation notice
         # The notice itself must stay under Discord's per-message cap.
         assert len(capped[-1]) <= MAX
 

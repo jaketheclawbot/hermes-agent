@@ -51,6 +51,9 @@ def shell(agent):
     cli.session_id = "owner"
     cli._session_db = agent._session_db
     cli.conversation_history = []
+    cli.provider = "test"
+    cli.model = "test-model"
+    cli.base_url = ""
     cli._pending_input = queue.Queue()
     cli._ensure_runtime_credentials = lambda: True
     cli._active_agent_route_signature = "test"
@@ -115,7 +118,7 @@ def test_real_cli_chat_boundary(outcome, registry, tmp_path, monkeypatch):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("outcome", ["success", "failed", "partial", "interrupted", "exception", "cancel", "unpersisted", "write-failure"])
 async def test_real_gateway_parent_boundary(outcome, registry, tmp_path, monkeypatch):
-    from tests.gateway.test_42039_duplicate_user_message import _bootstrap, _event, _source
+    from tests.gateway.test_duplicate_user_message import _bootstrap, _event, _source
     runner = _bootstrap(monkeypatch, tmp_path)
     runner._set_session_env = lambda *a, **kw: None
     runner._clear_session_env = lambda *a: None
@@ -191,7 +194,7 @@ async def test_gateway_watcher_waits_for_parent_and_retries_only_ack(accepted, r
 def gateway_result(agent, result):
     from types import SimpleNamespace
     from unittest.mock import MagicMock
-    from gateway.run import TurnRunner
+    from gateway.run_turn_runner import TurnRunner
     from gateway.turn_context import TurnContext
     from gateway.session import SessionSource
     from gateway.config import Platform
@@ -385,7 +388,7 @@ def test_executor_construction_failure_removes_phantom_dispatch(monkeypatch, tmp
 async def test_real_adapter_enqueue_waits_for_durable_parent(outcome, registry, tmp_path, monkeypatch):
     from gateway.platforms.base import BasePlatformAdapter, SendResult
     from gateway.config import PlatformConfig, Platform
-    from tests.gateway.test_42039_duplicate_user_message import _bootstrap, _source
+    from tests.gateway.test_duplicate_user_message import _bootstrap, _source
     class LocalAdapter(BasePlatformAdapter):
         async def connect(self, **kw): return True
         async def disconnect(self): pass

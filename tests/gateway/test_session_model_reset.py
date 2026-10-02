@@ -1,12 +1,12 @@
 """Tests that /new (and its /reset alias) clears session-scoped overrides."""
 from datetime import datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
-from gateway.platforms.base import MessageEvent
+from gateway.platforms.event import MessageEvent
 from gateway.session import SessionEntry, SessionSource, build_session_key
 
 
@@ -92,7 +92,10 @@ async def test_new_command_only_clears_own_session():
     runner._pending_model_notes[session_key] = "[Note: switched to gpt-4o.]"
     runner._pending_model_notes[other_key] = "[Note: switched to claude-sonnet-4-6.]"
 
-    await runner._handle_reset_command(_make_event("/new"))
+    with patch("tools.computer_use.desktop_lease.cancel_desktop_wait") as cancel_wait:
+        await runner._handle_reset_command(_make_event("/new"))
+
+    cancel_wait.assert_called_once_with(session_key)
 
     assert session_key not in runner._session_model_overrides
     assert other_key in runner._session_model_overrides

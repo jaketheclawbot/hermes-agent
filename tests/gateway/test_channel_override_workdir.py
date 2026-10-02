@@ -243,7 +243,15 @@ def test_relay_wire_preserves_ancestor_ids():
     assert event.source.ancestor_chat_ids == ("222", "111")
 
 
-def test_concurrent_workdirs_isolate_context_file_terminal_and_file_tools(tmp_path):
+def test_concurrent_workdirs_isolate_context_file_terminal_and_file_tools(tmp_path, monkeypatch):
+    from tools.environments.local import LocalEnvironment
+
+    def _skip_login_snapshot(self):
+        # This test exercises per-command cwd routing, not user shell startup.
+        self._snapshot_ready = False
+        self._prefer_nonlogin = True
+
+    monkeypatch.setattr(LocalEnvironment, "init_session", _skip_login_snapshot)
     workspaces = []
     for name in ("alpha", "docs"):
         workspace = tmp_path / name

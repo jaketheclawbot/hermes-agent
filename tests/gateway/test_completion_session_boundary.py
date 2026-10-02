@@ -51,6 +51,12 @@ class _SessionDB:
 
 
 def _runner(adapter, *, session_db=...):
+    def admit(event):
+        event._gateway_accepted = True
+        # Durable completion injection requires proof that the turn itself was
+        # accepted, not merely that the adapter admitted the message.
+        event._terminal_turn_accepted = True
+    adapter.handle_message.side_effect = admit
     runner = object.__new__(GatewayRunner)
     runner._running = True
     runner.adapters = {Platform.TELEGRAM: adapter}

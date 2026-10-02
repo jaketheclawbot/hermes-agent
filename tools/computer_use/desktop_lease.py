@@ -21,6 +21,10 @@ from typing import Any, Callable, Dict, Iterator
 _LEASE_SECONDS = 3600.0
 _WAIT_SECONDS = 3 * 60 * 60.0
 _EVENT_CLAIM_SECONDS = 30.0
+_MAX_QUEUE_ITEMS = 1024
+_MAX_IDENTIFIER_CHARS = 2048
+_MAX_ROUTE_VALUE_CHARS = 4096
+_MAX_CLAIM_BATCH = 20
 _THREAD_GUARD = threading.RLock()
 _WAIT_NOTIFIER: Callable[[], None] | None = None
 
@@ -162,6 +166,13 @@ def acquire_desktop(
 ) -> Dict[str, Any]:
     """Claim the desktop, block briefly, or durably park in FIFO order."""
     owner_id = str(session_id or "").strip() or f"pid:{os.getpid()}"
+    if len(owner_id) > _MAX_IDENTIFIER_CHARS:
+        return {
+            "ok": False,
+            "code": "desktop_coordinator_unavailable",
+            "error": "Shared desktop session identity exceeds the safe storage limit.",
+            "hint": "Start a new session with a valid identity; do not bypass the lease.",
+        }
     state_path, guard_path = _paths()
     deadline = time.monotonic() + max(0.0, float(wait_seconds))
     while True:
@@ -212,6 +223,13 @@ def acquire_desktop(
                 None,
             )
             if existing is None:
+                if len(queue) >= _MAX_QUEUE_ITEMS:
+                    return {
+                        "ok": False,
+                        "code": "desktop_coordinator_unavailable",
+                        "error": "Shared desktop wait queue reached its safe storage limit.",
+                        "hint": "No desktop action was executed; wait for queued work to clear.",
+                    }
                 existing = {
                     "session_id": owner_id,
                     "label": _label(owner_id),
@@ -220,18 +238,40 @@ def acquire_desktop(
                     "expires_at": stamp + (_WAIT_SECONDS if park else _LEASE_SECONDS),
                 }
                 if park:
+                    routing = _routing(owner_id)
+                    if any(
+                        len(str(value or "")) > _MAX_ROUTE_VALUE_CHARS
+                        for value in routing.values()
+                    ):
+                        return {
+                            "ok": False,
+                            "code": "desktop_coordinator_unavailable",
+                            "error": "Shared desktop return route exceeds the safe storage limit.",
+                            "hint": "No desktop action was executed; start a new session with a valid route.",
+                        }
                     existing.update({
                         "wait_id": f"desktop_wait_{uuid.uuid4().hex}",
                         "parked": True,
-                        **_routing(owner_id),
+                        **routing,
                     })
                 queue.append(existing)
             elif park and not existing.get("parked"):
+                routing = _routing(owner_id)
+                if any(
+                    len(str(value or "")) > _MAX_ROUTE_VALUE_CHARS
+                    for value in routing.values()
+                ):
+                    return {
+                        "ok": False,
+                        "code": "desktop_coordinator_unavailable",
+                        "error": "Shared desktop return route exceeds the safe storage limit.",
+                        "hint": "No desktop action was executed; start a new session with a valid route.",
+                    }
                 existing.update({
                     "wait_id": f"desktop_wait_{uuid.uuid4().hex}",
                     "parked": True,
                     "expires_at": stamp + _WAIT_SECONDS,
-                    **_routing(owner_id),
+                    **routing,
                 })
             _write(state_path, {"owner": owner, "queue": queue})
             if park:
@@ -397,7 +437,7 @@ def claim_desktop_wait_events(
                 "claim_id": claim_id,
             })
             claimed.append(event)
-            if len(claimed) >= max(1, int(limit)):
+            if len(claimed) >= min(_MAX_CLAIM_BATCH, max(1, int(limit))):
                 break
         _write(state_path, {"owner": owner, "queue": queue})
     return claimed
