@@ -1675,10 +1675,11 @@ class TestTerminateHostPidPosix:
             "#!/usr/bin/env bash\n"
             f"trap 'echo child-TERM >> {log}; exit 0' TERM\n"
             f"echo up >> {log}\nwhile :; do sleep 0.1; done\n")
+        # Install the handler before the child can publish its readiness signal.
         parent_sh.write_text(
             "#!/usr/bin/env bash\n"
-            f"bash {child_sh} & kid=$!\n"
             f"trap 'echo parent-TERM >> {log}; kill -KILL $kid; wait $kid; exit 0' TERM\n"
+            f"bash {child_sh} & kid=$!\n"
             "while :; do sleep 0.1; done\n")
         parent = subprocess.Popen(["bash", str(parent_sh)], stdin=subprocess.DEVNULL)
         try:
