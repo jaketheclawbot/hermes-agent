@@ -166,22 +166,24 @@ class TestResolveChannelPrompts:
         adapter.config.extra = {"channel_prompts": {"200": "Parent prompt"}}
         adapter.build_source = MagicMock(return_value=SimpleNamespace())
         adapter._get_effective_topic = MagicMock(return_value=None)
+        adapter._format_thread_chat_name = MagicMock(return_value="Wetlands / #parent / new-thread")
         adapter.handle_message = AsyncMock()
 
         category = SimpleNamespace(id=111, parent=None)
-        parent = SimpleNamespace(id=200, parent=category)
+        parent = SimpleNamespace(id=200, name="parent", parent=category)
+        thread = SimpleNamespace(id=999, name="new-thread", parent_id=200, parent=parent)
         interaction = SimpleNamespace(
             guild=SimpleNamespace(name="Wetlands"),
             channel=parent,
             user=SimpleNamespace(id=1, display_name="Brenner"),
         )
 
-        await adapter._dispatch_thread_session(interaction, "999", "new-thread", "hello")
+        await adapter._dispatch_thread_session(interaction, thread, "hello")
 
         dispatched_event = adapter.handle_message.await_args.args[0]
         source_kwargs = adapter.build_source.call_args.kwargs
         assert source_kwargs["parent_chat_id"] == "200"
-        assert source_kwargs["ancestor_chat_ids"] == ("111",)
+        assert source_kwargs["ancestor_chat_ids"] == ("200", "111")
         assert dispatched_event.channel_prompt == "Parent prompt"
 
     def test_blank_prompts_are_ignored(self):
@@ -216,4 +218,3 @@ async def test_retry_preserves_channel_prompt(monkeypatch):
     assert result == "ok"
     retried_event = runner._handle_message.await_args.args[0]
     assert retried_event.channel_prompt == "Channel prompt"
-
