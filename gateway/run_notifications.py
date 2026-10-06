@@ -2196,10 +2196,8 @@ class GatewayNotificationsMixin:
                 break
             if agent_notify and process_registry.is_completion_consumed(session_id):
                 getattr(process_registry, "retry_accepted_terminal_acknowledgements", lambda: None)()
-                if session_id in getattr(process_registry, "_accepted_terminal_ack_retries", set()):
+                if session_id in getattr(process_registry, "_pending_terminal_entries", {}):
                     continue
-                # Tool observation remains durable until its parent turn accepts it;
-                # this watcher must not wait for an acceptance it cannot produce.
                 break
             if silent:
                 # Still wait for the process to exit so we can log it, but don't push any messages.

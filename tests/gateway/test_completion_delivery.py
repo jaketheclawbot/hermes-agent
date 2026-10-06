@@ -222,6 +222,7 @@ def test_explicit_kill_returns_output_before_consuming_notification(monkeypatch)
     registry = ProcessRegistry()
     session = ProcessSession(
         id="proc_kill_consumed",
+        session_key="agent:main:telegram:dm:123",
         command="sleep 999",
         task_id="task",
         started_at=1.0,
@@ -239,6 +240,11 @@ def test_explicit_kill_returns_output_before_consuming_notification(monkeypatch)
     assert result["status"] == "killed"
     assert result["output"] == "important terminal output\n"
     assert registry.is_completion_consumed(session.id)
+    # Tool output observation is not parent acceptance. Retain evidence until the
+    # owning turn succeeds; the watcher should suppress only after that receipt.
+    assert session.id in registry._pending_terminal_entries
+    assert registry.acknowledge_consumed_terminal_notifications(session.session_key)
+    assert session.id not in registry._pending_terminal_entries
 
     adapter = SimpleNamespace(handle_message=AdmittingHandler())
     runner = _runner(adapter)
