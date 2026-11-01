@@ -139,7 +139,6 @@ def scheduler_report(
     name = safe_text(job.get("name") or job.get("id") or "cron job", 120)
     job_id = safe_text(job.get("id") or name, 120)
     why = plain_failure_reason(error, cause)
-    detail = bounded_evidence(error, 420) or "not recorded"
     next_step = f"Inspect the saved diagnostics with `hermes cron runs {job_id}`."
     if guidance:
         next_step += " " + safe_text(guidance, 360)
@@ -155,7 +154,7 @@ def scheduler_report(
         "**Repair:** Evidence unavailable in this scheduler notice; no repair activity asserted.\n"
         f"**Next:** {next_step}\n"
         "**Your action:** Whether action is required is not determined by this scheduler notice.\n"
-        f"**Technical:** {detail}"
+        f"**Details:** `hermes cron runs {job_id}`"
     )
 
 
@@ -248,10 +247,10 @@ def repair_summary(
     if status == "runtime_activation_pending":
         if (packet.get("route") or {}).get("kind") == "updater_launcher_recovery":
             return (
-                "The scoped recovery stopped at the native-service activation boundary; no "
-                "source repair or service action was performed.",
-                reason or "The reviewed external activation owner must validate and load the dormant service.",
-                "A human operator must review the existing external activation helper; the gateway must not load or submit the service.",
+                "No repair agent was started: the missing background service must be loaded "
+                "from an external Terminal, which this gateway is not allowed to do.",
+                "The external operator loads the dormant service using the reviewed helper; then the recovery owner verifies it.",
+                "Run the reviewed service-loading command from your Mac Terminal or Termius shell.",
             )
         owner = safe_text(packet.get("next_owner") or "the existing task owner", 100)
         return (
@@ -312,5 +311,5 @@ def reconciler_report(
         f"**Repair:** {repair}\n"
         f"**Next:** {next_step}\n"
         f"**Your action:** {julian}\n"
-        f"**Technical:** {bounded_evidence(error, 420) or 'not recorded'}"
+        f"**Details:** `hermes cron runs {safe_text(job.get('id'), 80)}`"
     )
