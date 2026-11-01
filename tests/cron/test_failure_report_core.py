@@ -15,6 +15,14 @@ def test_scheduler_notice_does_not_invent_recovery():
     assert 'reconciler has not processed' not in report
 
 
+def test_local_limit_is_not_reported_as_provider_credit_exhaustion():
+    from cron.failure_report import triage_summary
+    report = triage_summary({'category': 'technical', 'provider_error': 'JEV daily call/spend ceiling'})
+    assert 'JEV was not called' in report
+    assert 'local daily safety limit' in report
+    assert 'not a JEV credit-balance error' in report
+
+
 def test_older_attempts_are_labelled_as_incident_history():
     report, _, _ = repair_summary(
         {'action': 'bounded_escalation', 'reason': 'Attempt limit reached'},

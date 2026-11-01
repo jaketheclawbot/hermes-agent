@@ -176,6 +176,11 @@ def triage_summary(decision: Mapping[str, Any]) -> str:
             )
         return f"JEV categorized this operation as '{category}'{confidence_text}."
     if decision.get("provider_error"):
+        if "JEV daily call/spend ceiling" in str(decision["provider_error"]):
+            return (
+                f"JEV was not called: this monitor reached its local daily safety limit. "
+                f"This is not a JEV credit-balance error. Local fallback: '{category}'."
+            )
         return (
             f"JEV was unavailable ({safe_text(decision['provider_error'], 120)}); the "
             f"deterministic fallback used '{category}'."
