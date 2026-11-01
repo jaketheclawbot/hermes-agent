@@ -288,72 +288,9 @@ def _log_tick_yield_once(reason: str) -> None:
 
 
 def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
-    """One-line failure notice for chat delivery (full details stay in the run output).
+    from cron.scheduler_failure_copy import summarize_cron_failure_for_delivery
 
-    Deterministic scheduler/script shapes are matched first (their text can contain "timed out"
-    and would otherwise be blamed on the model service); everything else goes through the shared
-    ``classify_api_error`` verdict and the copy table in ``scheduler_failure_copy``."""
-    from cron.scheduler_failure_copy import (
-        classify_cron_failure_reason, generic_failure_notice, inactivity_notice,
-        provider_failure_notice, script_timeout_notice)
-
-    job_name = job.get("name") or job.get("id") or "cron job"
-    job_id = job.get("id") or job_name
-    text = (error or "unknown error").strip()
-    lower = text.lower()
-
-    # Script runner contract ("Script timed out after {n}s: {path}") — also for agent jobs with a
-    # context script. Must precede provider classification so it never claims a model failure.
-    # See #78503, #82460.
-    if lower.startswith("script timed out"):
-        return script_timeout_notice(job_name, job_id)
-
-    # Scheduler inactivity watchdog ("idle for {n}s (limit {m}s)"): the job's OWN tool call went
-    # quiet, no model service involved. Its text may still contain "timed out", so it must be
-    # recognised before the classifier (field-reported: a stuck `terminal` call was blamed on the
-    # provider and the operator debugged the wrong system).
-    if re.search(r"idle for \d+s\s*\(limit \d+s\)", lower):
-        return inactivity_notice(job_name, job_id)
-
-    # no_agent jobs never reach a model, so provider errors are structurally impossible for them:
-    # gate on job MODE before classifying, or a script's own wording ("429", "timed out") would
-    # blame the wrong subsystem.
-    if not job.get("no_agent"):
-        notice = provider_failure_notice(
-            job_name, job_id, classify_cron_failure_reason(text),
-            backup_provider_phrase=_fallback_chain_phrase(job), provider=job.get("provider"))
-        if notice is not None:
-            return notice
-
-    # Strip exception wrappers; bound input first so a multi-KB blob can't slow the regexes.
-    cleaned = re.sub(r"^(RuntimeError|Exception|ValueError|HTTPStatusError):\s*", "", text[:2000])
-    cleaned = re.sub(r"\s+", " ", cleaned).strip().rstrip(".")
-    if len(cleaned) > 180:
-        cleaned = cleaned[:177].rstrip() + "..."
-    message = generic_failure_notice(job_name, job_id, cleaned)
-
-    # Import-class failures (#95294 part 3): a long-lived gateway whose checkout was updated
-    # underneath it (interrupted `hermes update`, manual git pull) serves MIXED modules and every
-    # agent cron job dies with `cannot import name X`. The error reads like a code bug, so APPEND
-    # cause + fix — never replace the raw error, which carries the failing symbol. Fail-safe: skew
-    # is None on non-git/no-fingerprint; no_agent jobs excluded (a fresh subprocess resolves
-    # imports against disk, so its ImportError is the script's own problem).
-    if not job.get("no_agent") and re.search(
-        r"cannot import name|modulenotfounderror|importerror", lower
-    ):
-        try:
-            skew = _detect_gateway_code_skew()
-        except Exception:
-            skew = None  # delivery must never die on a diagnostics probe
-        if skew is not None:
-            boot_rev, disk_rev = skew
-            message += (
-                f" Likely cause: the gateway is running stale code (booted "
-                f"on {boot_rev}, disk is at {disk_rev}) — run "
-                "`hermes gateway restart` to fix it."
-            )
-
-    return message
+    return summarize_cron_failure_for_delivery(job, error)
 
 
 DEFAULT_FAILURE_REPEAT_ALERT_HOURS = 6.0
@@ -2975,7 +2912,9 @@ def _compose_run_delivery(
         # Bypass the generic failure summarizer (its auth/timeout heuristics would mislabel this).
         _pf_text = re.sub(r"\[blocked_config[^\]]*\]\s*", "", err).strip()
         from cron.scheduler_failure_copy import blocked_config_notice
-        deliver_content = blocked_config_notice(job.get("name") or job["id"], _pf_text)
+        from cron.failure_report import scheduler_report
+        notice = blocked_config_notice(job.get("name") or job["id"], _pf_text)
+        deliver_content = scheduler_report(job, err, cause=notice)
     elif success:
         deliver_content = final_response
         _resolve_incidents_for_recovered_job(job)
@@ -2992,10 +2931,12 @@ def _compose_run_delivery(
             # The agent already diagnosed the failure in prose; the summarizer's substring
             # heuristics would re-diagnose it ("timed out" -> blame the model service, "401" ->
             # "sign in again") and attach the wrong remediation. Deliver the evidence as-is.
+            from cron.failure_report import scheduler_report
             from cron.scheduler_failure_copy import generic_failure_notice
-            deliver_content = generic_failure_notice(
+            notice = generic_failure_notice(
                 job.get("name") or job["id"], job["id"], err.strip().rstrip("."),
             ) + _failure_streak_nudge(job)
+            deliver_content = scheduler_report(job, err, cause=notice)
         else:
             from cron.quota_hold import hold_notice
             deliver_content = (

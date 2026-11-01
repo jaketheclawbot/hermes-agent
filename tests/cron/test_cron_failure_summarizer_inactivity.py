@@ -46,6 +46,7 @@ def test_genuine_provider_timeout_with_no_fallback_configured(monkeypatch):
     assert "did not respond in time" in msg
     assert "No backup provider is configured" in msg
     assert "succeeded either" not in msg
+    assert "next scheduled time" not in msg
 
 
 def test_genuine_provider_timeout_with_fallback_configured(monkeypatch):
@@ -61,8 +62,10 @@ def test_genuine_provider_timeout_with_fallback_configured(monkeypatch):
     error = "Request timed out."
     msg = _summarize_cron_failure_for_delivery(job, error)
     assert "did not respond in time" in msg
-    assert "No backup provider succeeded either." in msg
+    assert "A backup provider is configured" in msg
+    assert "no evidence it was attempted" in msg
     assert "No backup provider is configured" not in msg
+    assert "succeeded either" not in msg
 
 
 def test_fallback_chain_phrase_fails_open_on_config_error(monkeypatch):

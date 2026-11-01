@@ -14,6 +14,60 @@ from typing import Any, Optional
 from hermes_constants import display_hermes_home
 
 
+def summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
+    """Human-readable failure report; full diagnostics remain in the private run output."""
+    from cron import scheduler
+    from cron.failure_report import scheduler_report
+
+    job_name = job.get("name") or job.get("id") or "cron job"
+    job_id = job.get("id") or job_name
+    text = (error or "unknown error").strip()
+    lower = text.lower()
+
+    def report(notice: str, guidance: Optional[str] = None) -> str:
+        return scheduler_report(job, text, cause=notice, guidance=guidance)
+
+    # Script runner and inactivity-watchdog shapes precede provider classification: both may
+    # contain timeout-like words even though no provider failed.
+    if lower.startswith("script timed out"):
+        return report(script_timeout_notice(job_name, job_id))
+    if re.search(r"idle for \d+s\s*\(limit \d+s\)", lower):
+        return report(inactivity_notice(job_name, job_id))
+
+    # A no-agent script never invokes a model, so provider classification is impossible.
+    if not job.get("no_agent"):
+        reason = classify_cron_failure_reason(text)
+        cause = _provider_failure_cause(reason)
+        if cause is not None:
+            return report(cause, provider_failure_guidance(
+                reason, job_id, provider=job.get("provider"), scheduler=scheduler,
+            ))
+
+    cleaned = re.sub(r"^(RuntimeError|Exception|ValueError|HTTPStatusError):\s*", "", text[:2000])
+    cleaned = re.sub(r"\s+", " ", cleaned).strip().rstrip(".")
+    if len(cleaned) > 180:
+        cleaned = cleaned[:177].rstrip() + "..."
+    message = generic_failure_notice(job_name, job_id, cleaned)
+
+    # Import failures may come from a gateway whose checkout changed underneath it. Keep the raw
+    # symbol in the notice and append the restart cause only when the existing probe proves skew.
+    if not job.get("no_agent") and re.search(
+        r"cannot import name|modulenotfounderror|importerror", lower
+    ):
+        try:
+            skew = scheduler._detect_gateway_code_skew()
+        except Exception:  # health: allow BLE001 -- optional skew diagnostics must not break delivery
+            skew = None
+        if skew is not None:
+            boot_rev, disk_rev = skew
+            message += (
+                f" Likely cause: the gateway is running stale code (booted "
+                f"on {boot_rev}, disk is at {disk_rev}) — run "
+                "`hermes gateway restart` to fix it."
+            )
+    return report(message)
+
+
 def cron_output_dir_display(job_id: str) -> str:
     """User-facing path of a job's saved run output (profile-aware)."""
     return f"{display_hermes_home()}/cron/output/{job_id}/"
@@ -83,6 +137,27 @@ _PROVIDER_FAILURE_ACTION["provider_policy_blocked"] = (
     "or pin another model with `hermes cron edit {job_id} --model <name>`."
 )
 _DEFAULT_FAILURE_ACTION = "Run it again with `hermes cron run {job_id}`, or edit it with `hermes cron edit {job_id}`."
+
+
+def provider_failure_guidance(reason: str, job_id: str, *, provider: Any, scheduler: Any) -> str:
+    """Concise provider facts/actions without claiming an automatic retry or fallback attempt."""
+    if reason in _TRANSIENT_REASONS:
+        try:
+            configured = bool(scheduler.get_fallback_chain(scheduler.load_config()))
+        except Exception:  # health: allow BLE001 -- optional config must not break failure delivery
+            configured = None
+        if configured is True:
+            fact = "A backup provider is configured, but this notice has no evidence it was attempted."
+        elif configured is False:
+            fact = "No backup provider is configured."
+        else:
+            fact = "Backup-provider configuration is unavailable in this notice."
+        return fact + f" Use `hermes cron run {job_id}` only if you want a manual run."
+    from agent.turn_failure_copy import relogin_command_hint
+
+    return _PROVIDER_FAILURE_ACTION.get(reason, _DEFAULT_FAILURE_ACTION).format(
+        job_id=job_id, relogin=relogin_command_hint(provider),
+    )
 
 
 def provider_failure_notice(
