@@ -162,6 +162,7 @@ def triage_summary(decision: Mapping[str, Any]) -> str:
     """Describe only the classifier evidence attached to the current decision."""
     category = safe_text(decision.get("category") or "technical", 40)
     jev = decision.get("jev") if isinstance(decision.get("jev"), Mapping) else None
+    cached = decision.get("classification_provenance") == "cached"
     if jev:
         confidence = jev.get("confidence")
         confidence_text = (
@@ -170,17 +171,26 @@ def triage_summary(decision: Mapping[str, Any]) -> str:
             else ""
         )
         if jev.get("source") == "jev_low_confidence":
+            if cached:
+                return (
+                    f"Cached low-confidence JEV diagnosis for the same incident; the "
+                    f"deterministic category is '{category}'{confidence_text}."
+                )
             return (
                 f"JEV was low-confidence{confidence_text}; the deterministic fallback used "
                 f"'{category}'."
             )
+        if cached:
+            return f"Cached JEV diagnosis for the same incident: '{category}'{confidence_text}."
         return f"JEV categorized this operation as '{category}'{confidence_text}."
     if decision.get("provider_error"):
         if "JEV daily call/spend ceiling" in str(decision["provider_error"]):
             return (
-                f"JEV was not called: this monitor reached its local daily safety limit. "
-                f"This is not a JEV credit-balance error. Local fallback: '{category}'."
+                "Historical result: JEV was not called because the local daily safety limit "
+                "was reached. That limit has since been removed; this is not a JEV credit-balance error."
             )
+        if cached:
+            return f"Cached deterministic diagnosis for the same incident: '{category}'."
         return (
             f"JEV was unavailable ({safe_text(decision['provider_error'], 120)}); the "
             f"deterministic fallback used '{category}'."
@@ -252,10 +262,10 @@ def repair_summary(
     if status == "runtime_activation_pending":
         if (packet.get("route") or {}).get("kind") == "updater_launcher_recovery":
             return (
-                "No repair agent was started: the missing background service must be loaded "
-                "from an external Terminal, which this gateway is not allowed to do.",
-                "The external operator loads the dormant service using the reviewed helper; then the recovery owner verifies it.",
-                "Run the reviewed service-loading command from your Mac Terminal or Termius shell.",
+                "No repair agent was started: service lifecycle actions are outside this "
+                "incident worker's authority.",
+                "The existing external owner verifies current service state and the original operation.",
+                "No service action is inferred from this report; the parent durability review owns that decision.",
             )
         owner = safe_text(packet.get("next_owner") or "the existing task owner", 100)
         return (
