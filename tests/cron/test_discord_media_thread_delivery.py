@@ -62,6 +62,13 @@ def discord_upload_primitives(monkeypatch):
     monkeypatch.setattr(discord_platform.discord.http, "Route", _Route)
 
 
+def _voice_header_fixture():
+    # Ogg/Opus header fixture sufficient for duration parsing, not playable test audio.
+    return (b"OggS" + b"\x00\x02" + (48000).to_bytes(8, "little")
+            + b"\x00" * 12 + b"\x01\x13" + b"OpusHead" + b"\x01\x01" + b"\x00" * 9)
+
+
+@pytest.mark.parametrize("voice", [False, True])
 @pytest.mark.parametrize(
     ("deliver", "origin", "expected_target", "suffix", "payload"),
     [
@@ -93,6 +100,7 @@ def test_live_discord_cron_media_uses_resolved_text_target(
     expected_target,
     suffix,
     payload,
+    voice,
 ):
     """Exercise _deliver_result through DeliveryRouter and DiscordAdapter."""
     parent = _Channel(111)
@@ -111,6 +119,8 @@ def test_live_discord_cron_media_uses_resolved_text_target(
         lambda: {"cron": {"wrap_response": False, "mirror_delivery": False}},
     )
 
+    if voice:
+        suffix, payload = ".ogg", _voice_header_fixture()
     media = tmp_path / f"report{suffix}"
     media.write_bytes(payload)
     job = {
@@ -127,7 +137,7 @@ def test_live_discord_cron_media_uses_resolved_text_target(
     try:
         error = _deliver_result(
             job,
-            f"Report ready.\nMEDIA:{media}",
+            f"Report ready.\n" + ("[[audio_as_voice]]\n" if voice else "") + f"MEDIA:{media}",
             adapters={Platform.DISCORD: adapter},
             loop=loop,
         )
@@ -141,7 +151,7 @@ def test_live_discord_cron_media_uses_resolved_text_target(
     other = parent if expected_target == 222 else thread
     assert other.sends == []
     assert target.sends[0]["content"] == "Report ready."
-    if suffix != ".ogg":
+    if not voice:
         assert [send.get("content") for send in target.sends] == [
             "Report ready.",
             None,

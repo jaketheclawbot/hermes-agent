@@ -1377,8 +1377,14 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         if session.pid is None:
             raise RuntimeError(f"launch wrapper exited {result.get('returncode')} without a PID: "
                                f"{output or '(no output)'}")
-        self._track_started(
-            session, self._env_poller_loop, f"proc-poller-{session.id}", (env, log_path, pid_path, exit_path))
+        try:
+            self._track_started(
+                session, self._env_poller_loop, f"proc-poller-{session.id}", (env, log_path, pid_path, exit_path))
+        except Exception:
+            # This PID belongs to the sandbox namespace, never signal it on the host.
+            with suppress(Exception):
+                env.execute(f"kill {session.pid} 2>/dev/null", timeout=5)
+            raise
         return session
 
     # ----- Reader / Poller Threads -----

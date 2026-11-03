@@ -344,6 +344,8 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             if (ctx.progress_grouping == "rolling" and ctx.tool_progress_enabled
                     and ctx.progress_queue is not None and not already_streamed and str(text or "").strip()):
                 ctx.progress_queue.put(f"💬 {text}")
+                # Rolling activity owns commentary; do not also send a standalone message.
+                return
             if stream_consumer is not None:
                 stream_consumer.on_segment_break() if already_streamed else stream_consumer.on_commentary(text)
             elif not already_streamed and ctx._status_adapter and str(text or "").strip():

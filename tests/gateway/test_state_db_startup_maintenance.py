@@ -131,7 +131,6 @@ async def test_adapter_connect_precedes_blocked_current_schema_fts_probe_and_wri
     # Keep this contract test on the platform/DB boundary. Target main has
     # unrelated startup warmups that may launch environment probes; they are
     # independently covered and are forbidden by the isolated acceptance harness.
-    monkeypatch.setattr(runner, "_start_free_tier_bootstrap", lambda: None)
     monkeypatch.setattr(runner, "_start_startup_warmup", lambda: None)
 
     async def no_finish_wiring(_connected_count):
@@ -347,7 +346,6 @@ async def test_gateway_shutdown_awaits_maintenance_before_db_close(
     runner = GatewayRunner(
         GatewayConfig(platforms={}, sessions_dir=tmp_path / "sessions")
     )
-    monkeypatch.setattr(runner, "_start_free_tier_bootstrap", lambda: None)
     monkeypatch.setattr(runner, "_start_startup_warmup", lambda: None)
 
     async def no_finish_wiring(_connected_count):
