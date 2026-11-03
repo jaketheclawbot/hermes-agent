@@ -36,7 +36,9 @@ def _callback_api():
     if vault_unlock is not None:
         pairs.extend(((vault_unlock.get_unlock_prompt_callback, vault_unlock.set_unlock_prompt_callback),
                       (vault_unlock.get_save_login_prompt_callback, vault_unlock.set_save_login_prompt_callback),
-                      (vault_unlock.get_code_prompt_callback, vault_unlock.set_code_prompt_callback)))
+                      (vault_unlock.get_code_prompt_callback, vault_unlock.set_code_prompt_callback),
+                      # The unlock owner: a manager unlocked on a worker must still be released with its session.
+                      (vault_unlock.get_current_session_id, vault_unlock.set_current_session_id)))
     return tuple(pairs)
 
 
