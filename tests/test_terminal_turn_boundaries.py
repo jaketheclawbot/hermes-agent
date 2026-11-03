@@ -458,6 +458,7 @@ async def test_real_batch_enqueue_separates_parent_identity(field):
     adapter = SimpleNamespace(handle_message=AsyncMock())
     runner = _runner(adapter)
     runner._classify_completion_target = AsyncMock(return_value="deliver")
+    runner._classify_completion_owner = AsyncMock(side_effect=lambda parent, key="": ("deliver", parent, parent))
     runner._completion_notification_batch_window = .01
     first = _completion_event(started_at=1, session_id="proc-one")
     second = _completion_event(started_at=2, session_id="proc-two")
@@ -477,6 +478,7 @@ async def test_closed_parent_disposition_write_failure_retries(registry, monkeyp
     from tests.gateway.test_completion_delivery import _runner
     runner = _runner(SimpleNamespace(handle_message=AsyncMock()))
     runner._classify_completion_target = AsyncMock(return_value="terminal")
+    runner._classify_completion_owner = AsyncMock(return_value=("terminal", "", ""))
     event = observed(registry, consumed=False)
     event["parent_session_id"] = "closed"
     writer = registry._write_checkpoint
