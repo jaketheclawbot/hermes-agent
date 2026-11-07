@@ -119,6 +119,7 @@ The rules that most often send a submission back: the plugin must extend Hermes 
 | **Git** | With the `git-lfs` extension installed |
 | **Python 3.14** | The project requires `>=3.14,<3.15`; PM provides the pinned interpreter |
 | **Node.js** | Use the PM pin, or a version accepted by root `package.json`: `>=26` |
+| **pnpm** | Exactly the `pm/lock.json` pin; `source ./activate` provides it |
 
 ### PM developer environment
 
@@ -201,15 +202,23 @@ than copying production credentials into the checkout.
 
 ### JavaScript workspaces and website
 
-From the repository root, run `npm ci` for the desktop, TUI, dashboard, and
-shared JS workspaces. The website is separate:
+From the repository root, run `pnpm install --frozen-lockfile` for the desktop,
+TUI, dashboard, and shared JS workspaces. `pm/lock.json` pins pnpm
+(`source ./activate`, or `. .\activate.ps1` in PowerShell, provides that exact
+version). An install that runs lifecycle scripts refuses any other pnpm, a direct or
+filtered `pnpm install` included: the root `preinstall` script requires the
+`pm/lock.json` pnpm (and refuses `npm install`), and pnpm 10 and 11 also refuse the
+root `engines.pnpm` range. pnpm 12 skips the root `preinstall` under
+`--ignore-scripts`, `--lockfile-only` (which writes `pnpm-lock.yaml`) and `pnpm fetch`,
+so another pnpm 12 is not refused there; CI installs every changed lockfile with the
+pinned pnpm under `--frozen-lockfile`. The website is a separate npm project:
 
 ```bash
 npm ci --prefix website
 npm run build:fast --prefix website
 ```
 
-Use a Node/npm version accepted by the corresponding `package.json` engines.
+Use a Node version accepted by the corresponding `package.json` engines.
 Native desktop dependencies can also require the platform build toolchain.
 
 Logos and icons are generated from `assets/nous-girl-*.svg` and
