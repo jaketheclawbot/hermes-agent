@@ -130,7 +130,8 @@
     "ws": "8.22.0"
   },
   "engines": {
-    "node": ">=26"
+    "node": ">=26",
+    "npm": "npm is refused here: run pnpm install --frozen-lockfile at the repository root"
   },
   "main": "dist/electron-main.mjs",
   "name": "hermes",
