@@ -21,13 +21,20 @@ class ProcessCheckpointMixin:
         """Write running process metadata to the checkpoint file atomically."""
         from tools.process_registry import _checkpoint_path, _CHECKPOINT_FIELDS
         from hermes_cli.active_sessions import _FileLock
+        from tools.environments.sandbox_scope import hosted_scope
         from utils import atomic_json_write
 
+        # A hosted caller only changes its own agent's records, which are never persisted here, so
+        # it has no host change to write: it neither takes the lock nor rewrites this host's file.
+        if hosted_scope() is not None:
+            return True
         try:
             with self._lock:
                 entries = []
                 for s in self._running.values():
-                    if s.exited:
+                    # A hosted agent's process is not this host's to persist: its record (command,
+                    # cwd, owner) stays in memory, whoever triggers the write (scoped or not).
+                    if s.exited or s.sandbox_key:
                         continue
                     # Backfill the start time so recovery can detect PID recycling
                     # even for sessions spawned before this field existed.
@@ -47,7 +54,8 @@ class ProcessCheckpointMixin:
                 tracked_ids = {item.get("session_id") for item in entries}
                 entries.extend(
                     item for sid, item in self._pending_terminal_entries.items()
-                    if sid not in tracked_ids)
+                    if sid not in tracked_ids
+                    and not item.get("terminal_event", {}).get("sandbox_key"))
                 known = {*self._running, *self._finished}
                 path = _checkpoint_path()
                 # Every interpreter of the profile (owner, each managed worker) rewrites this file
@@ -112,6 +120,7 @@ class ProcessCheckpointMixin:
                         task_id=terminal_event.get("task_id", ""),
                         owner_task_id=terminal_event.get("owner_task_id", ""),
                         session_key=terminal_event.get("session_key", ""),
+                        sandbox_key=terminal_event.get("sandbox_key", ""),
                         pid=entry.get("pid"), host_start_time=entry.get("host_start_time"),
                         pid_scope=entry.get("pid_scope", "host"),
                         started_at=terminal_event.get("started_at") or time.time(), detached=True,
@@ -212,7 +221,7 @@ class ProcessCheckpointMixin:
             fields.update(
                 command=entry.get("command", "unknown"),
                 owner_task_id=entry.get("owner_task_id", "") or entry.get("task_id", ""),
-                started_at=entry.get("started_at", time.time()))
+                started_at=entry.get("started_at", time.time()), sandbox_key=entry.get("sandbox_key", ""))
             # detached: no Popen handle, but can report status + kill; a worker spawn's output log
             # (and recorded exit) outlives its spawner, so tail it from the start.
             fields["output_log"] = log
