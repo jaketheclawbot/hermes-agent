@@ -45,6 +45,8 @@ def _bare_runner() -> GatewayRunner:
 @pytest.mark.asyncio
 async def test_hung_preagent_resolve_is_cancelled_and_notified(monkeypatch, caplog):
     monkeypatch.setenv("HERMES_AGENT_TIMEOUT", "0.05")
+    # This deadline test does not benchmark stack walks through unrelated host threads.
+    monkeypatch.setattr("gateway.run._dump_wedged_turn_stacks", lambda _key: None)
     runner = _bare_runner()
 
     async def _hang(*_args, **_kwargs):

@@ -18,6 +18,12 @@ import pytest
 from tests.tools.test_delegate_continue import _completion, _parent, _ScriptedModel, _spawn
 
 
+@pytest.fixture(autouse=True)
+def isolated_sweep_processes(monkeypatch):
+    # These fixtures create no external worktree owners; never inspect real host cwd paths.
+    monkeypatch.setattr("hermes_cli.worktree_sweep.live_process_pids", lambda *_args: {})
+
+
 def _db_rows(parent):
     import sqlite3
     conn = sqlite3.connect(parent._session_db.db_path)  # health: allow HX015 -- test reads a temp-home store

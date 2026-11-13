@@ -18,6 +18,12 @@ from tests.tools.test_delegate_resumable import _db_rows, _FailingModel, _forget
 from tests.tools.test_delegate_resumable_pins import _backdate, _repo, _run
 
 
+@pytest.fixture(autouse=True)
+def isolated_sweep_processes(monkeypatch):
+    # These fixtures create no external worktree owners; never inspect real host cwd paths.
+    monkeypatch.setattr("hermes_cli.worktree_sweep.live_process_pids", lambda *_args: {})
+
+
 def _tree(repo, name, *, dirty):
     tree = repo / ".worktrees" / name
     _git("worktree", "add", "-qb", name, str(tree), cwd=repo)
