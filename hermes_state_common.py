@@ -754,6 +754,21 @@ CREATE TABLE IF NOT EXISTS async_delegations (
     origin_session_id TEXT NOT NULL DEFAULT ''
 );
 
+-- Durable subagent records (tools/delegate_tool_resumable.py): what delegate_task(action='continue') rebuilds a
+-- child from after a restart or crash, and the worktree pin the startup sweep honours (``pinned``).
+CREATE TABLE IF NOT EXISTS resumable_subagents (
+    subagent_id TEXT PRIMARY KEY,
+    state TEXT NOT NULL,
+    pinned INTEGER NOT NULL DEFAULT 0,
+    stop_cause TEXT,
+    owner_pid INTEGER,
+    owner_started_at INTEGER,
+    record_json TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    expires_at REAL
+);
+
 """
 
 
