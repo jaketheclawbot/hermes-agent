@@ -62,7 +62,7 @@ _DB_LOCK = threading.Lock()
 # Database path -> ((device, inode), schema_version) last reconciled by this process.
 # Per connection the replay ran ~30 PRAGMA table_info plus the DDL on every ledger call,
 # three times per 30 s orphan sweep (after #135351).
-_SCHEMA_READY: dict[str, tuple[tuple[int, int], int]] = {}
+_SCHEMA_INITIALIZED_PATHS: dict[str, tuple[tuple[int, int], int]] = {}
 _SCHEMA_READY_LOCK = threading.Lock()
 
 # ── Orphaned-completion sweep ────────────────────────────────────────────────
@@ -176,7 +176,7 @@ def _initialize_schema(conn: sqlite3.Connection, *, identity: tuple[int, int] | 
         return
     version = conn.execute("PRAGMA schema_version").fetchone()[0]
     with _SCHEMA_READY_LOCK:
-        if _SCHEMA_READY.get(key) == (identity, version):
+        if _SCHEMA_INITIALIZED_PATHS.get(key) == (identity, version):
             return
     # Single durable-shape authority: the canonical SCHEMA_SQL drives both
     # table creation and column backfill (reconcile_state_schema replays the
@@ -188,7 +188,7 @@ def _initialize_schema(conn: sqlite3.Connection, *, identity: tuple[int, int] | 
     reconcile_state_schema(conn)
     if _db_identity(key) == identity:
         with _SCHEMA_READY_LOCK:  # version AFTER replay; don't mark a replacement as reconciled
-            _SCHEMA_READY[key] = (identity, conn.execute("PRAGMA schema_version").fetchone()[0])
+            _SCHEMA_INITIALIZED_PATHS[key] = (identity, conn.execute("PRAGMA schema_version").fetchone()[0])
 
 
 def _transaction():
@@ -1609,4 +1609,4 @@ def _reset_for_tests() -> None:
     with _held_lock:
         _held_copies.clear()
     with _SCHEMA_READY_LOCK:
-        _SCHEMA_READY.clear()
+        _SCHEMA_INITIALIZED_PATHS.clear()

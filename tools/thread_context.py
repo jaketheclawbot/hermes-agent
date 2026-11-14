@@ -39,9 +39,6 @@ def _callback_api():
                       (vault_unlock.get_code_prompt_callback, vault_unlock.set_code_prompt_callback),
                       # The unlock owner: a manager unlocked on a worker must still be released with its session.
                       (vault_unlock.get_current_session_id, vault_unlock.set_current_session_id)))
-    if "hermes_cli.plugins" in sys.modules:
-        # A background fork's dispatch-side tool whitelist: without it a parallel batch escapes it.
-        pairs.append((_get_tool_whitelist, _set_tool_whitelist))
     return tuple(pairs)
 
 
@@ -75,7 +72,11 @@ def propagate_context_to_thread(target: Callable) -> Callable:
     # (setter, parent callback) pairs; None when the callback API could not be captured.
     installs = None
     try:
-        installs = tuple((setter, getter()) for getter, setter in _callback_api())
+        callback_api = _callback_api()
+        if "hermes_cli.plugins" in sys.modules:
+            # A background fork's dispatch-side tool whitelist: without it a parallel batch escapes it.
+            callback_api += ((_get_tool_whitelist, _set_tool_whitelist),)
+        installs = tuple((setter, getter()) for getter, setter in callback_api)
     except Exception:
         logger.debug("Could not capture parent approval/sudo callbacks", exc_info=True)
 
