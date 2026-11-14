@@ -164,6 +164,8 @@ async def test_connect_does_not_wait_for_thread_routing_reconciliation(monkeypat
 
     monkeypatch.setattr(discord_platform.commands, "Bot", PersistentBot)
     monkeypatch.setattr(adapter, "_resolve_allowed_usernames", AsyncMock())
+    # This regression measures post-ready routing, not cold plugin/skill discovery.
+    monkeypatch.setattr(adapter, "_register_slash_commands", lambda: None)
 
     reconciliation_started = asyncio.Event()
     allow_reconciliation_to_finish = asyncio.Event()
