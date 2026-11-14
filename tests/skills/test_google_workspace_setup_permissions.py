@@ -17,6 +17,102 @@ SCRIPT_PATH = (
 )
 
 
+@pytest.fixture
+def storage_module():
+    spec = importlib.util.spec_from_file_location(
+        "google_workspace_secure_storage_test", SCRIPT_PATH.with_name("_secure_storage.py")
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_private_writer_collision_preserves_unowned_file_and_destination(
+    storage_module, monkeypatch, tmp_path
+):
+    destination = tmp_path / "document.json"
+    destination.write_bytes(b"existing destination")
+    collision = destination.with_suffix(".tmp.12345.fixednonce")
+    collision.write_bytes(b"unowned collision")
+    monkeypatch.setattr(storage_module.os, "getpid", lambda: 12345)
+    monkeypatch.setattr(storage_module.secrets, "token_hex", lambda size: "fixednonce")
+
+    with pytest.raises(FileExistsError):
+        storage_module.write_private_json(destination, {"value": "replacement"})
+
+    assert destination.read_bytes() == b"existing destination"
+    assert collision.exists(), "exclusive-create failure must not remove an unowned file"
+    assert collision.read_bytes() == b"unowned collision"
+
+
+def test_private_writer_replaces_only_after_private_synced_json(
+    storage_module, monkeypatch, tmp_path
+):
+    destination = tmp_path / "document.json"
+    destination.write_bytes(b"existing destination")
+    destination.chmod(0o644)
+    payload = {"value": "replacement"}
+    real_open = storage_module.os.open
+    real_fsync = storage_module.os.fsync
+    real_replace = storage_module.os.replace
+    events = []
+
+    def observe_open(path, flags, mode):
+        fd = real_open(path, flags, mode)
+        assert Path(path).stat().st_mode & 0o777 == 0o600
+        events.append("created")
+        return fd
+
+    def observe_fsync(fd):
+        real_fsync(fd)
+        events.append("synced")
+
+    def observe_replace(source, target):
+        assert events == ["created", "synced"]
+        assert target == destination
+        assert destination.read_bytes() == b"existing destination"
+        assert json.loads(source.read_text(encoding="utf-8")) == payload
+        assert source.stat().st_mode & 0o777 == 0o600
+        real_replace(source, target)
+        events.append("replaced")
+
+    monkeypatch.setattr(storage_module.os, "open", observe_open)
+    monkeypatch.setattr(storage_module.os, "fsync", observe_fsync)
+    monkeypatch.setattr(storage_module.os, "replace", observe_replace)
+    storage_module.write_private_json(destination, payload)
+
+    assert events == ["created", "synced", "replaced"]
+    assert json.loads(destination.read_text(encoding="utf-8")) == payload
+    assert destination.stat().st_mode & 0o777 == 0o600
+    assert list(tmp_path.glob("document.tmp.*")) == []
+
+
+@pytest.mark.parametrize("stage", ["serialization", "fsync", "replace"])
+def test_private_writer_failure_cleans_owned_temp_preserves_destination(
+    storage_module, monkeypatch, tmp_path, stage
+):
+    destination = tmp_path / "document.json"
+    destination.write_bytes(b"existing destination")
+
+    def fail(*args, **kwargs):
+        temporary, = tmp_path.glob("document.tmp.*")
+        assert temporary.stat().st_mode & 0o777 == 0o600
+        if stage == "serialization":
+            args[1].write('{"partial":')
+        raise OSError(f"injected {stage} failure")
+
+    if stage == "serialization":
+        monkeypatch.setattr(storage_module.json, "dump", fail)
+    else:
+        monkeypatch.setattr(storage_module.os, stage, fail)
+
+    with pytest.raises(OSError, match=f"injected {stage} failure"):
+        storage_module.write_private_json(destination, {"value": "replacement"})
+
+    assert destination.read_bytes() == b"existing destination"
+    assert list(tmp_path.glob("document.tmp.*")) == []
+
+
 class FakeCredentials:
     granted_scopes = None
 

@@ -14,12 +14,13 @@ def write_private_json(path: Path, data: Any) -> None:
     """Atomically write JSON that only the owner can read (mode 0600 from creation)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(f".tmp.{os.getpid()}.{secrets.token_hex(4)}")
+    # Cleanup is ours only after exclusive creation succeeds.
+    fd = os.open(
+        str(tmp_path),
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        stat.S_IRUSR | stat.S_IWUSR,
+    )
     try:
-        fd = os.open(
-            str(tmp_path),
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-            stat.S_IRUSR | stat.S_IWUSR,
-        )
         with os.fdopen(fd, "w", encoding="utf-8") as file:
             json.dump(data, file, indent=2)
             file.flush()
