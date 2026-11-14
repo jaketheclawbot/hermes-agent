@@ -631,7 +631,7 @@ class TestStdinHelpers:
         lockout (#17959). For interactive stdin → PTY mode is now the only
         supported path.
         """
-        command = f'{shlex.quote(sys.executable)} -c "import sys; print(sys.stdin.read().strip())"'
+        command = f'{shlex.quote(sys.executable)} -c "import sys; print(\'stdin-ready\', flush=True); print(sys.stdin.read().strip())"'
         session = registry.spawn_local(
             command,
             cwd=str(tmp_path),
@@ -639,12 +639,12 @@ class TestStdinHelpers:
         )
 
         try:
-            # Wait for the PTY child to be up rather than sleeping blindly.
+            # Running records precede shell/PTY initialization; wait for the reader.
             assert _wait_until(
-                lambda: registry.poll(session.id)["status"] == "running",
+                lambda: "stdin-ready" in registry.poll(session.id)["output_preview"],
                 timeout=5.0,
                 interval=0.02,
-            ), "PTY session never reached running"
+            ), "PTY child never reached its stdin reader"
             assert registry.submit_stdin(session.id, "hello")["status"] == "ok"
             assert registry.close_stdin(session.id)["status"] == "ok"
 
