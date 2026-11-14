@@ -27,7 +27,7 @@ _IS_WINDOWS = platform.system() == "Windows"
 # See #70716.
 _IS_LINUX = platform.system() == "Linux"
 from tools.environments.sandbox_scope import hosted_scope, producer_fields
-from tools.environments.local import _append_dropped_path_entries, _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env, _terminal_env
+from tools.environments.local import _append_dropped_path_entries, _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env, _terminal_env, routed_terminal_base
 from hermes_cli._subprocess_compat import windows_hide_flags
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, NamedTuple, Optional
@@ -1182,9 +1182,9 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
 
     @staticmethod
     def _spawn_env(env_vars: dict) -> dict:
-        """Sanitized child env from the session's client toolchain; PYTHONUNBUFFERED so poll sees progress."""
+        """Sanitized child env from the served profile's base, as foreground commands; PYTHONUNBUFFERED."""
         from agent.session_client_env import toolchain_environ
-        env = _terminal_env(_sanitize_subprocess_env(toolchain_environ(), env_vars))
+        env = _terminal_env(_sanitize_subprocess_env(toolchain_environ(routed_terminal_base()), env_vars))
         env["PYTHONUNBUFFERED"] = "1"
         return env
 
@@ -1883,7 +1883,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
                 and reader is not None and reader.is_alive())
 
     def is_completion_consumed(self, session_id: str) -> bool:
-        """Check if a completion notification was already consumed via wait/log."""
+        """True once wait/log/kill/acked poll consumed it; keyed by the full id, never a short prefix."""
         return session_id in self._completion_consumed
 
     def is_session_waiting(self, session_id: str) -> bool:
@@ -2217,17 +2217,15 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
                 logger.debug("Non-blocking drain failed for %s: %s", session.id, e)
         with session._lock:
             session.mark_exited(rc)
-        logger.info(
-            "Reconciled session %s: direct child exited with code %s but reader "
-            "was still blocked (orphaned pipe). Flipped to exited.",
-            session.id, rc)
+        logger.info("Reconciled session %s: direct child exited with code %s but reader was still blocked "
+                    "(orphaned pipe). Flipped to exited.", session.id, rc)
         self._move_to_finished(session)
 
     @staticmethod
     def _status_head(session: ProcessSession) -> dict:
         return {"session_id": session.id, "command": session.command, "status": "exited" if session.exited else "running"}
 
-    def poll(self, session_id: str) -> dict:
+    def poll(self, session_id: str, acknowledge: bool = False) -> dict:
         """Check status and get new output for a background process."""
         session = self.get(session_id)
         if session is None or self._uncollected_gone(session):
@@ -2243,12 +2241,13 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
             "uptime_seconds": int(time.time() - session.started_at), "output_preview": output_preview}
         if exited:
             result.update(self._exit_fields(session))
-            # Read-only: record in _poll_observed (CLI inline dedup) but NOT in
-            # _completion_consumed, or a status check would suppress the watcher's
-            # autonomous delivery turn. See __init__. A preview taken before the reader's
-            # final drain is partial and must not suppress the full completion.
+            # Read-only unless acknowledged: _poll_observed is CLI inline dedup only; a plain status check must
+            # not suppress the watcher's autonomous turn (#10156), an acknowledged handled result must (#94455).
+            # A preview taken before the reader's final drain is partial and must not suppress the completion.
             if not finalizing:
-                self._poll_observed.add(session_id)
+                self._poll_observed.add(session.id)
+                if acknowledge:
+                    self._mark_completion_consumed(session.id)
         if session.detached and not session.output_log:
             result.update(detached=True, note="Process recovered after restart -- output history unavailable")
         return result
@@ -2393,7 +2392,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
                 self._mark_completion_consumed(session.id)
             return result
         try:
-            early = self._signal_kill(session, session_id, consume_output)
+            early = self._signal_kill(session, consume_output)
             if early is not None:
                 return early
             # Additive to the PID kill: stopping the scope reaps double-forked
@@ -2467,7 +2466,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         session._scope_stop_pending = not stopped
         return stopped
 
-    def _signal_kill(self, session: ProcessSession, session_id: str, consume_output: bool) -> Optional[dict]:
+    def _signal_kill(self, session: ProcessSession, consume_output: bool) -> Optional[dict]:
         """Deliver the kill via PTY, local Popen tree, sandbox exec or recovered host
         PID. Returns a final result dict when the kill cannot proceed (recycled/dead
         recovered PID, or no runtime handle), else None."""
@@ -2495,7 +2494,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
                 with session._lock:
                     output = _completion_output(session)
                 if consume_output:
-                    self._completion_consumed.add(session_id)
+                    self._mark_completion_consumed(session.id)
                 # No waitable handle, so this is not a collected exit. Close the
                 # entry without queueing a completion, and do not signal a PID
                 # whose start time does not match.
@@ -2858,6 +2857,7 @@ PROCESS_SCHEMA = {
                 "type": "integer",
                 "description": "Log line offset (default: last 200)."
             },
+            "acknowledge": {"type": "boolean", "description": "'poll' on an exited process: you handled its result, so skip its notify_on_complete turn."},
             "limit": {
                 "type": "integer",
                 "description": "Max log lines.",
@@ -2923,7 +2923,7 @@ def _list_processes(task_id) -> dict:
 # action -> (handler(session_id, args) -> dict, redact output?). Output-bearing
 # actions are redacted; stdin actions return only status.
 _SESSION_ACTIONS = {
-    "poll": (lambda sid, a: process_registry.poll(sid), True),
+    "poll": (lambda sid, a: process_registry.poll(sid, acknowledge=a.get("acknowledge") is True), True),
     "log": (lambda sid, a: process_registry.read_log(sid, offset=a.get("offset"), limit=a.get("limit", 200)), True),
     "wait": (lambda sid, a: process_registry.wait(sid, timeout=a.get("timeout")), True),
     "kill": (lambda sid, a: process_registry.kill_process(sid), True),
