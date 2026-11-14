@@ -388,7 +388,7 @@ def test_executor_construction_failure_removes_phantom_dispatch(monkeypatch, tmp
 async def test_real_adapter_enqueue_waits_for_durable_parent(outcome, registry, tmp_path, monkeypatch):
     # Exercise real adapter/SQLite acceptance, not unrelated cold plugin loading.
     # Profile-scoped discovery can exceed the bounded parent-acceptance wait.
-    monkeypatch.setattr("hermes_cli.plugins.discover_plugins", lambda *a, **kw: None)
+    monkeypatch.setattr("hermes_cli.plugins.PluginManager.discover_and_load", lambda *a, **kw: None)
     from gateway.platforms.base import BasePlatformAdapter, SendResult
     from gateway.config import PlatformConfig, Platform
     from tests.gateway.test_duplicate_user_message import _bootstrap, _source
