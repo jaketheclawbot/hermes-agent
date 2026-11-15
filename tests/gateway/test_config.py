@@ -1246,7 +1246,8 @@ class TestLoadGatewayConfig:
 
         assert os.environ.get("FEISHU_ALLOW_BOTS") == "mentions"
 
-    def test_feishu_allow_bots_env_takes_precedence_over_config_yaml(self, tmp_path, monkeypatch):
+    @pytest.mark.parametrize("source", ["dotenv", "inherited"])
+    def test_feishu_allow_bots_env_takes_precedence_over_config_yaml(self, tmp_path, monkeypatch, source):
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()
         config_path = hermes_home / "config.yaml"
@@ -1257,10 +1258,17 @@ class TestLoadGatewayConfig:
 
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
         monkeypatch.setenv("FEISHU_ALLOW_BOTS", "none")
+        from hermes_cli import env_loader
+        monkeypatch.setattr(env_loader, "_LOADED_DOTENV_KEYS", set())
+        monkeypatch.setattr(env_loader, "_MANAGED_DOTENV_KEYS", set())
+        monkeypatch.setattr(env_loader, "_DOTENV_PUBLISHED", {})
+        if source == "dotenv":
+            (hermes_home / ".env").write_text("FEISHU_ALLOW_BOTS=none\n", encoding="utf-8")
+            env_loader.load_hermes_dotenv(hermes_home=hermes_home, load_external_secrets=False)
 
         load_gateway_config()
 
-        assert os.environ.get("FEISHU_ALLOW_BOTS") == "none"
+        assert os.environ.get("FEISHU_ALLOW_BOTS") == ("none" if source == "dotenv" else "all")
 
     def test_bridges_telegram_allow_bots_from_config_yaml_to_env(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
@@ -1278,7 +1286,8 @@ class TestLoadGatewayConfig:
 
         assert os.environ.get("TELEGRAM_ALLOW_BOTS") == "mentions"
 
-    def test_telegram_allow_bots_env_takes_precedence_over_config_yaml(self, tmp_path, monkeypatch):
+    @pytest.mark.parametrize("source", ["dotenv", "inherited"])
+    def test_telegram_allow_bots_env_takes_precedence_over_config_yaml(self, tmp_path, monkeypatch, source):
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()
         config_path = hermes_home / "config.yaml"
@@ -1289,10 +1298,17 @@ class TestLoadGatewayConfig:
 
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
         monkeypatch.setenv("TELEGRAM_ALLOW_BOTS", "none")
+        from hermes_cli import env_loader
+        monkeypatch.setattr(env_loader, "_LOADED_DOTENV_KEYS", set())
+        monkeypatch.setattr(env_loader, "_MANAGED_DOTENV_KEYS", set())
+        monkeypatch.setattr(env_loader, "_DOTENV_PUBLISHED", {})
+        if source == "dotenv":
+            (hermes_home / ".env").write_text("TELEGRAM_ALLOW_BOTS=none\n", encoding="utf-8")
+            env_loader.load_hermes_dotenv(hermes_home=hermes_home, load_external_secrets=False)
 
         load_gateway_config()
 
-        assert os.environ.get("TELEGRAM_ALLOW_BOTS") == "none"
+        assert os.environ.get("TELEGRAM_ALLOW_BOTS") == ("none" if source == "dotenv" else "all")
 
     def test_invalid_quick_commands_in_config_yaml_are_ignored(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
