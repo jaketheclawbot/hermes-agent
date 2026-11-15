@@ -206,6 +206,10 @@ def acquire(
     from hermes_state import _default_db_path
 
     raw_path = Path(db_path) if db_path is not None else Path(_default_db_path())
+    if os.name != "nt":
+        from hermes_state_dbfile import refuse_planted_state_db_link
+
+        refuse_planted_state_db_link(raw_path)
     try:
         path = raw_path.resolve()
     except OSError:
