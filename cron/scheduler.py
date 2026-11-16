@@ -1871,7 +1871,7 @@ def _raise_inactivity_timeout(agent, job_name: str, limit_s: float) -> None:
 
 def _run_agent_with_watchdog(
     agent, prompt: str, job: dict, job_id: str, job_name: str, task_id: str, cancel_event,
-    worker_state: Optional[dict] = None,
+    worker_state: Optional[dict] = None, conversation_history=None,
 ) -> dict:
     """Run ``agent.run_conversation`` on a worker thread under the inactivity (not wall-clock)
     watchdog: default 600s, override HERMES_CRON_TIMEOUT, 0 = unlimited."""
@@ -1917,8 +1917,10 @@ def _run_agent_with_watchdog(
     _cron_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     # Carry scheduler-scoped ContextVar state (e.g. env passthrough) into the worker thread.
     _cron_context = contextvars.copy_context()
+    _resume_kwargs = ({"conversation_history": conversation_history}
+                      if conversation_history is not None else {})
     _cron_future = _cron_pool.submit(
-        _cron_context.run, agent.run_conversation, prompt, task_id=task_id)
+        _cron_context.run, agent.run_conversation, prompt, task_id=task_id, **_resume_kwargs)
     if worker_state is not None:
         worker_state["future"] = _cron_future
     _inactivity_timeout = False
@@ -2110,6 +2112,9 @@ def _finalize_cron_session(session_db, agent, job_id: str, job_name: str, cron_s
     # because classification is best-effort metadata and must not mislabel a healthy run.
     _end_reason = "cron_complete"
     try:
+        from tools.computer_use.desktop_lease import parked_desktop_wait
+        if parked_desktop_wait(_final_cron_session_id):
+            _end_reason = "desktop_parked"
         _statuses = _session_db.session_lifecycle_statuses([_final_cron_session_id])
         _lifecycle = _statuses.get(_final_cron_session_id)
         if _lifecycle in ("interrupted", "error", "empty"):
@@ -2477,6 +2482,7 @@ class _FireAudit:
 def run_job(
     job: dict, *, defer_agent_teardown: Optional[list] = None, extra_prompt: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None, execution_id: Optional[str] = None,
+    resume_wait_id: Optional[str] = None,
 ) -> tuple[bool, str, str, Optional[str]]:
     """Execute a single cron job. Returns (success, full_output_doc, final_response, error).
     ``defer_agent_teardown``: if a list, the live agent is appended instead of torn down; the caller
@@ -2497,6 +2503,8 @@ def run_job(
     owner_execution = current_execution()
     if owner_execution is not None and owner_execution[2:] != (job['id'], execution_id):
         owner_execution = None
+    if resume_wait_id is not None and owner_execution is None:
+        raise RuntimeError("Desktop continuation requires the original cron owner")
     if not job.get("no_agent") and owner_execution is None:
         from cron.scheduler_authority import run_canonical_job
         return run_canonical_job(job, extra_prompt=extra_prompt, cancel_event=cancel_event,
@@ -2504,7 +2512,11 @@ def run_job(
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
 
-    early, prompt = _prepare_job_prompt(job, job_id, job_name, extra_prompt, cancel_event)
+    if resume_wait_id is not None:
+        from gateway.session_desktop_wait import RESUME_PROMPT
+        early, prompt = None, RESUME_PROMPT
+    else:
+        early, prompt = _prepare_job_prompt(job, job_id, job_name, extra_prompt, cancel_event)
     if early is not None:
         return early
     from run_agent import AIAgent
@@ -2536,6 +2548,12 @@ def run_job(
 
         # Open state.db only after every early-return gate has passed.
         _session_db = _open_cron_session_db(job)
+        resume_kwargs = {}
+        if resume_wait_id is not None:
+            from gateway.session_desktop_wait import checkpoint_history
+            _cron_session_id, history = checkpoint_history(_session_db, _cron_session_id, resume_wait_id)
+            _session_db.reopen_session(_cron_session_id)
+            resume_kwargs["conversation_history"] = history
         agent = _construct_cron_agent(
             AIAgent, job, _cfg, setup, workdir=scope.workdir, session_id=_cron_session_id,
             session_db=_session_db)
@@ -2543,8 +2561,13 @@ def run_job(
 
         result = _run_agent_with_watchdog(
             agent, prompt, job, job_id, job_name, scope.task_id, cancel_event,
-            worker_state=_worker_state)
+            worker_state=_worker_state, **resume_kwargs)
         final_response = _final_response_from_result(result, job_id, job_name, AIAgent)
+        from tools.computer_use.desktop_lease import parked_desktop_wait
+        if parked_desktop_wait(str(getattr(agent, "session_id", "") or _cron_session_id)):
+            # The occurrence is accounted for once; only the release-driven
+            # continuation delivers its eventual result. Never report busy as done.
+            final_response = SILENT_MARKER
         if (setup.fallback_notice and final_response.strip() and not _is_cron_silence_response(final_response)
                 and _cron_failure_marker_error(final_response) is None):
             # Pre-agent provider switch (#74349) rides with the delivered report; silence and the

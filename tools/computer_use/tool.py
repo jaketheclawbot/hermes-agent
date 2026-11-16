@@ -345,7 +345,7 @@ def handle_computer_use(args: dict[str, Any], **kwargs) -> Any:
     # never launch a driver or touch the UI.  The conversation finalizer owns
     # release; repeated actions by the same session renew idempotently.
     from tools.computer_use.desktop_lease import acquire_desktop
-    desktop_admission = acquire_desktop(session_id, wait_seconds=0)
+    desktop_admission = acquire_desktop(session_id, wait_seconds=0, park=True)
     if not desktop_admission.get("ok"):
         return json.dumps(desktop_admission, ensure_ascii=False)
     # Acquire separately so startup errors retain the install hint; the stack

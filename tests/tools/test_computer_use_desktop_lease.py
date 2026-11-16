@@ -363,6 +363,34 @@ def test_terminal_remote_ssh_osascript_does_not_acquire_local_lease(monkeypatch)
     assert result["output"] == "GUI_AV_STARTED"
 
 
+def test_native_busy_durably_parks_without_starting_backend(lease_home, monkeypatch):
+    from tools.computer_use import tool
+    from tools.bot_desktop import runtime
+
+    monkeypatch.setattr(runtime, 'ensure_started_for_tool', lambda: None)
+    monkeypatch.setattr(tool, '_backend_for_call', lambda *a, **k: pytest.fail('backend started while busy'))
+    desktop_lease.acquire_desktop('owner')
+    first = json.loads(tool.handle_computer_use({'action': 'capture'}, session_id='native-waiter'))
+    repeated = json.loads(tool.handle_computer_use({'action': 'capture'}, session_id='native-waiter'))
+    assert first['code'] == 'desktop_parked'
+    assert first['wait_id'] == repeated['wait_id']
+    assert first['expires_in_seconds'] == 10800
+    state = json.loads(lease_home.read_text())
+    assert state['owner']['session_id'] == 'owner'
+    assert len(state['queue']) == 1
+    assert 'arguments' not in state['queue'][0]
+
+
+def test_expired_waiter_cannot_acquire_after_late_wake(lease_home):
+    desktop_lease.acquire_desktop('owner', now=100)
+    parked = desktop_lease.acquire_desktop('waiter', now=101, park=True)
+    desktop_lease.release_desktop('owner')
+    result = desktop_lease.acquire_desktop('waiter', now=101 + desktop_lease._WAIT_SECONDS + 1, park=True)
+    assert result['code'] == 'desktop_wait_expired'
+    assert result['wait_id'] == parked['wait_id']
+    assert not json.loads(lease_home.read_text())['owner']
+
+
 def test_computer_use_busy_fails_before_backend(monkeypatch):
     from tools.computer_use import tool
 
