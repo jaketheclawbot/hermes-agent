@@ -136,6 +136,19 @@ def _routing(session_id: str) -> Dict[str, str]:
         from gateway.session_context import get_session_env
         from hermes_constants import get_hermes_home
 
+        # A cron fire has no sender/interactive route. Preserve its scheduler-owned
+        # execution instead of borrowing a gateway thread's ambient chat context.
+        from gateway.session_cron import current_execution
+        execution = current_execution()
+        if execution is not None:
+            return {
+                "cron_session_id": execution[1],
+                "cron_job_id": execution[2],
+                "cron_execution_id": execution[3],
+                "origin_hermes_home": str(get_hermes_home()),
+                "parent_session_id": session_id,
+                "origin_session_id": session_id,
+            }
         values = {
             "platform": get_session_env("HERMES_SESSION_PLATFORM", ""),
             "chat_id": get_session_env("HERMES_SESSION_CHAT_ID", ""),
@@ -202,6 +215,13 @@ def acquire_desktop(
                     )) > stamp
                 )
             ]
+            expired_wait = next((item for item in queue
+                                 if item.get("session_id") == owner_id and item.get("parked")
+                                 and float(item.get("expires_at") or 0) <= stamp), None)
+            if expired_wait is not None:
+                return {"ok": False, "code": "desktop_wait_expired",
+                        "wait_id": expired_wait["wait_id"],
+                        "error": "The queued desktop request expired; no desktop action was executed."}
             blocked = bool(
                 (owner and owner.get("session_id") != owner_id)
                 or (not owner and queue and queue[0].get("session_id") != owner_id)
@@ -333,6 +353,20 @@ def release_desktop(session_id: str) -> bool:
         if owned:
             _notify_waiter_monitor()
         return owned
+
+
+def parked_desktop_wait(session_id: str) -> dict[str, Any] | None:
+    """Read this session's unresolved wait, including after normal turn cleanup."""
+    state_path, guard_path = _paths()
+    if not state_path.exists():
+        return None
+    with _guard(guard_path):
+        state = _read(state_path)
+        if state.get("_invalid"):
+            raise RuntimeError("Shared desktop lease state is unreadable")
+        return next((dict(item) for item in state.get("queue", [])
+                     if isinstance(item, dict) and item.get("parked")
+                     and item.get("session_id") == session_id), None)
 
 
 def cancel_desktop_wait(session_ref: str) -> bool:

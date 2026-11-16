@@ -286,6 +286,9 @@ def _run_identified(run_job, job, execution_id, **kwargs):
 async def execute(authority, ref, row, policy):
     from cron.scheduler import run_job
     from gateway.run import _profile_runtime_scope
+    if 'desktop_wait_v1' in row['payload']:
+        from gateway.session_desktop_wait import execute_cron_wait
+        return await execute_cron_wait(authority, ref, row, policy)
     data = json.loads(policy.request_json)
     if (row['payload'] != {'text': data['extra_prompt'] or ''}
             or row['request_id'] != data['request_id']

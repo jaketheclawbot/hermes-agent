@@ -1033,6 +1033,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         ``started_at`` are delivered undeduplicated rather than risk suppressing a real completion.
         """
         evt_type = str(evt.get("type") or "")
+        if evt_type in {"desktop_wait_ready", "desktop_wait_expired"} and evt.get("wait_id"):
+            return (evt_type, str(evt["wait_id"]), "")
         if evt_type == "async_delegation":
             producer_id = str(evt.get("delegation_id") or "")
             if not producer_id:
@@ -1671,83 +1673,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 logger.info("%s %d undelivered async completion(s) for profile %r", verb, count, profile_name)
 
     async def _desktop_wait_watcher(self, interval: float = 1.0) -> None:
-        """Wake parked desktop turns or report their three-hour expiry."""
-        from tools.computer_use.desktop_lease import (
-            claim_desktop_wait_events,
-            complete_desktop_wait_event,
-            discard_desktop_wait,
-        )
-
-        consumer_id = f"gateway:{os.getpid()}:{id(self)}"
-        while self._running:
-            events = await asyncio.to_thread(claim_desktop_wait_events, consumer_id)
-            for evt in events:
-                delivered = False
-                parent_session_id = str(evt.get("parent_session_id") or "").strip()
-                if parent_session_id:
-                    verdict = await self._classify_completion_target(parent_session_id)
-                    if verdict == "terminal":
-                        await asyncio.to_thread(
-                            discard_desktop_wait, str(evt.get("wait_id") or "")
-                        )
-                        continue
-                    if verdict == "retry":
-                        await asyncio.to_thread(
-                            complete_desktop_wait_event,
-                            str(evt.get("wait_id") or ""),
-                            str(evt.get("claim_id") or ""),
-                            delivered=False,
-                        )
-                        continue
-                try:
-                    if evt.get("type") == "desktop_wait_ready":
-                        synth_text = (
-                            "[IMPORTANT: The shared desktop is now available for your "
-                            "parked Computer Use request. Re-read the latest user messages "
-                            "before acting. If the request was superseded or cancelled, do "
-                            "not execute stale UI work. Otherwise resume the original task "
-                            "now by retrying the previously blocked desktop action. Do not "
-                            "send a mere status update; continue through verified completion.]"
-                        )
-                        delivered = bool(
-                            await self._inject_watch_notification(synth_text, evt)
-                        )
-                    else:
-                        source = await asyncio.to_thread(
-                            self._build_process_event_source, evt
-                        )
-                        adapter = self._adapter_for_source(source) if source else None
-                        if source and adapter:
-                            result = await adapter.send(
-                                source.chat_id,
-                                "⚠️ The queued Computer Use request expired after waiting "
-                                "three hours for the shared desktop. No desktop action was "
-                                "executed. If the task is still wanted, send a new message "
-                                "in this thread to queue it again.",
-                                metadata=self._thread_metadata_for_source(source),
-                            )
-                            delivered = bool(getattr(result, "success", False))
-                except Exception:
-                    logger.exception(
-                        "Desktop wait event delivery failed: wait_id=%s type=%s",
-                        evt.get("wait_id"), evt.get("type"),
-                    )
-                await asyncio.to_thread(
-                    complete_desktop_wait_event,
-                    str(evt.get("wait_id") or ""),
-                    str(evt.get("claim_id") or ""),
-                    delivered=delivered,
-                )
-            signal = getattr(self, "_desktop_wait_signal", None)
-            if signal is None:
-                await asyncio.sleep(interval)
-                continue
-            try:
-                await asyncio.wait_for(signal.wait(), timeout=interval)
-            except asyncio.TimeoutError:
-                pass
-            finally:
-                signal.clear()
+        from gateway.run_desktop_wait import watch_desktop_waits
+        await watch_desktop_waits(self, interval=interval)
 
     async def _async_delegation_watcher(self, interval: float = 2.0) -> None:
         """Drain async completions and pattern notifications even while sessions are idle.

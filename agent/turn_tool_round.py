@@ -181,6 +181,17 @@ def run_tool_round(
         failed = True
         return _verdict("break")
 
+    # Durable desktop parking is a turn boundary, not an invitation for the model
+    # to poll. Tool results are canonical above; a future wake resumes that history.
+    from tools.computer_use.desktop_lease import parked_desktop_wait
+    if (any(tc.function.name in {"computer_use", "terminal", "execute_code"}
+            for tc in assistant_message.tool_calls)
+            and getattr(agent, "session_id", None) and parked_desktop_wait(agent.session_id)):
+        _turn_exit_reason = "desktop_parked"
+        final_response = "[SILENT]"
+        append_message(messages, {"role": "assistant", "content": final_response})
+        return _verdict("break")
+
     if agent._tool_guardrail_halt_decision is not None:
         decision = agent._tool_guardrail_halt_decision
         _turn_exit_reason = "guardrail_halt"
