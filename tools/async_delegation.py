@@ -26,6 +26,7 @@ from hermes_constants import get_hermes_home, hermes_home_key
 from tools.daemon_pool import DaemonThreadPoolExecutor
 from tools.thread_context import propagate_context_to_thread
 from tools.async_delegation_worker import worker_ledger, require_ledger_owner
+from tools.delegate_tool_progress import SUBAGENT_FAILURE_STATUSES
 from tools.delegation_redaction import redact_child_result, redact_completion_event
 
 logger = logging.getLogger(__name__)
@@ -63,6 +64,7 @@ _DB_LOCK = threading.Lock()
 # Per connection the replay ran ~30 PRAGMA table_info plus the DDL on every ledger call,
 # three times per 30 s orphan sweep (after #135351).
 _SCHEMA_INITIALIZED_PATHS: dict[str, tuple[tuple[int, int], int]] = {}
+_SCHEMA_READY = _SCHEMA_INITIALIZED_PATHS
 _SCHEMA_READY_LOCK = threading.Lock()
 
 # ── Orphaned-completion sweep ────────────────────────────────────────────────
@@ -267,7 +269,7 @@ def _prune_durable_records() -> None:
                      ORDER BY updated_at ASC, delegation_id LIMIT ?
                    )""", (terminal_count - _MAX_RETAINED_COMPLETED,))
         pending_count = conn.execute("""SELECT COUNT(*) FROM async_delegations
-               WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'""").fetchone()[0]
+               WHERE state!='running' AND delivery_state='pending'""").fetchone()[0]
         if pending_count > _MAX_DURABLE_PENDING:
             logger.warning(
                 "Async delegation pending result backlog exceeds capacity by %d; preserving unacknowledged evidence.",
@@ -356,7 +358,7 @@ def recover_abandoned_delegations() -> int:
         rows = conn.execute("""SELECT delegation_id, origin_session, origin_ui_session_id,
                       parent_session_id, dispatched_at, owner_pid,
                       owner_started_at, task_json, origin_session_id, result_json, state
-               FROM async_delegations WHERE state IN ('running','finalizing')""").fetchall()
+               FROM async_delegations WHERE state='running'""").fetchall()
         for row in rows:
             delegation_id, session_key, origin_ui, parent_id, dispatched_at, pid, started, task_json, origin_sid, result_json, last_state = row
             if alive(pid, started):
@@ -590,7 +592,7 @@ def sweep_orphaned_completions(target_queue, *, now: Optional[float] = None) -> 
         rows = conn.execute("""SELECT delegation_id, event_json, completed_at, dispatched_at,
                       owner_pid, owner_started_at, delivery_attempts, updated_at
                FROM async_delegations
-               WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'
+               WHERE state!='running' AND delivery_state='pending'
                  AND event_json IS NOT NULL AND updated_at < ?
                  AND (delivery_claim IS NULL OR delivery_claimed_at < ?)
                ORDER BY completed_at, delegation_id""", (now - _ORPHAN_STALE_S, now - _CLAIM_LEASE_S)).fetchall()
@@ -638,15 +640,6 @@ def _update_delivery(sql: str, params: tuple) -> bool:
     """Run one UPDATE on the ledger; True iff exactly one row changed."""
     with _DB_LOCK, _transaction() as conn:
         return conn.execute(sql, params).rowcount == 1
-
-
-def mark_completion_delivered(delegation_id: str) -> bool:
-    """Atomically acknowledge successful injection of a durable completion."""
-    require_ledger_owner()
-    now = time.time()
-    return _update_delivery(
-        """UPDATE async_delegations SET delivery_state='delivered', delivered_at=?, updated_at=?
-           WHERE delegation_id=? AND delivery_state!='delivered'""", (now, now, delegation_id))
 
 
 def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
@@ -821,7 +814,7 @@ def get_durable_delegation(delegation_id: str) -> Optional[dict[str, Any]]:
         "delivery_attempts": row[6], "origin_session_id": row[7] or ""}
 
 
-_FAILED_TASK_STATES = frozenset({"error", "failed", "failure", "timeout", "stalled", "unknown", "interrupted"})
+_FAILED_TASK_STATES = SUBAGENT_FAILURE_STATUSES | {"stalled", "unknown", "interrupted"}
 _FAILURE_SURFACE_WINDOW_S = 24 * 3600.0
 
 
@@ -852,7 +845,7 @@ def failed_delegations_for_session(
     with _DB_LOCK, _transaction() as conn:
         rows = conn.execute(
             f"""SELECT delegation_id, state, dispatched_at, completed_at, task_json, result_json FROM async_delegations
-                WHERE ({owner_sql}) AND state NOT IN ('running','finalizing') AND completed_at >= ?
+                WHERE ({owner_sql}) AND state!='running' AND completed_at >= ?
                 ORDER BY completed_at DESC LIMIT ?""",
             (*(val for _, val in selectors), cutoff, limit)).fetchall()
     failed: list[dict[str, Any]] = []
@@ -974,8 +967,7 @@ def _batch_crash(error: str, duration: float) -> dict[str, Any]:
 def _batch_status(combined: dict[str, Any]) -> str:
     """Batch status: completed unless every child errored/was interrupted."""
     child_results = combined.get("results") or []
-    ok = ("completed", "success")
-    return "error" if child_results and all(r.get("status") not in ok for r in child_results) else "completed"
+    return "error" if child_results and all(r.get("status") != "completed" for r in child_results) else "completed"
 
 
 def _dispatch(**kwargs) -> dict[str, Any]:
