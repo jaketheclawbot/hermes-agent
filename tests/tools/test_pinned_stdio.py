@@ -4,6 +4,7 @@ from unittest.mock import patch
 import pytest
 from tools.computer_use.pinned_stdio import enabled
 from tools.computer_use import cua_backend as backend
+from tests.computer_use_fakes import reset_backend
 
 @pytest.fixture
 def receipt(tmp_path):
@@ -86,7 +87,7 @@ def test_actual_tool_factory_carries_effective_bypass_mode_to_pinned_backend(rec
 
     cfg, cmd = receipt
     monkeypatch.setenv('HERMES_COMPUTER_USE_BACKEND', 'cua')
-    tool.reset_backend_for_tests()
+    reset_backend()
     try:
         with patch.object(backend, '_computer_use_cfg', return_value=cfg), \
              patch.object(backend, 'resolve_cua_driver_cmd', return_value=cmd), \
@@ -99,7 +100,7 @@ def test_actual_tool_factory_carries_effective_bypass_mode_to_pinned_backend(rec
         assert selected._embedded_daemon is None
         start.assert_called_once_with(selected)
     finally:
-        tool.reset_backend_for_tests()
+        reset_backend()
 
 
 def test_actual_tool_path_fails_closed_without_effective_bypass(receipt, monkeypatch):
@@ -108,7 +109,7 @@ def test_actual_tool_path_fails_closed_without_effective_bypass(receipt, monkeyp
 
     cfg, cmd = receipt
     monkeypatch.setenv('HERMES_COMPUTER_USE_BACKEND', 'cua')
-    tool.reset_backend_for_tests()
+    reset_backend()
     try:
         with patch.object(backend, '_computer_use_cfg', return_value=cfg), \
              patch.object(backend, 'resolve_cua_driver_cmd', return_value=cmd), \
@@ -119,7 +120,7 @@ def test_actual_tool_path_fails_closed_without_effective_bypass(receipt, monkeyp
         assert 'requires unrestricted authorization' in result['error']
         start.assert_not_called()
     finally:
-        tool.reset_backend_for_tests()
+        reset_backend()
 
 
 def test_actual_resolution_rejects_poisoned_driver_override(receipt, monkeypatch):
@@ -134,7 +135,7 @@ def test_actual_resolution_rejects_poisoned_driver_override(receipt, monkeypatch
     Path(poisoned).chmod(0o755)
     monkeypatch.setenv('HERMES_CUA_DRIVER_CMD', poisoned)
     monkeypatch.setenv('HERMES_COMPUTER_USE_BACKEND', 'cua')
-    tool.reset_backend_for_tests()
+    reset_backend()
     try:
         with patch.object(backend, '_computer_use_cfg', return_value=cfg), \
              patch.object(approval, 'is_approval_bypass_active_for_session', return_value=True), \
@@ -144,7 +145,7 @@ def test_actual_resolution_rejects_poisoned_driver_override(receipt, monkeypatch
         assert 'does not match the approved receipt' in result['error']
         start.assert_not_called()
     finally:
-        tool.reset_backend_for_tests()
+        reset_backend()
 
 
 def test_extracted_driver_keeps_receipt_command_for_manifest_invocation(receipt):
