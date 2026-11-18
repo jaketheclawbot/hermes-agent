@@ -148,7 +148,18 @@ class SessionPersistenceMixin:
         other pin gives them no handle; unpinned it is None, and readers resolve the scope's handle per call so a
         multiplexed profile's writes reach its own store."""
         pinned = self._pinned_db()
-        return None if pinned is _DB_UNPINNED else pinned
+        if pinned is not _DB_UNPINNED:
+            return pinned
+        if not getattr(self, "_defer_fts_initialization", False):
+            return None
+        from hermes_constants import get_hermes_home
+        from hermes_state_registry import get_shared_session_db
+
+        path = Path(get_hermes_home()) / "state.db"
+        adapters = self.__dict__.setdefault("_deferred_db_adapters", {})
+        if path not in adapters:
+            adapters[path] = get_shared_session_db(path, defer_fts_initialization=True)
+        return adapters[path]
 
     @_db.setter
     def _db(self, value) -> None:
@@ -306,6 +317,11 @@ class SessionPersistenceMixin:
                 logger.debug("Storage handle close error during handle sweep: %s", exc)
 
         self._db_handle_cache.close_all(_close)
+        adapters = self.__dict__.pop("_deferred_db_adapters", {})
+        if adapters:
+            from hermes_state_registry import release_shared_session_db
+            for adapter in adapters.values():
+                release_shared_session_db(adapter)
 
     def _ensure_loaded(self) -> None:
         """Load sessions index from disk if not already loaded."""

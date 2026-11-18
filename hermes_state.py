@@ -126,6 +126,14 @@ def _scope_of(db_path: "Any") -> "Any":
     return profile_scope() if db_path is None else profile_scope(home=_Path(db_path).parent)
 
 
+def _default_db_path() -> "Path":
+    """The active profile's SQLite store path, resolved at call time."""
+    from persistence_assembly import profile_scope, store_location
+
+    scope = profile_scope()
+    return store_location(scope) or scope.profile_dir / "state.db"
+
+
 def _file_identity(scope: "Any") -> "Optional[tuple[int, int]]":
     """The device and inode of the file holding ``scope``'s store, or None when there is none."""
     from persistence_assembly import store_location
@@ -200,7 +208,10 @@ class _SessionDB:
     ``SessionDB`` used afterwards opens the same store again with a warning, a read-only one raises. A writable one
     collected unclosed has its handle released on the reaper thread."""
 
-    def __init__(self, db_path: "Optional[Path]" = None, read_only: "bool" = False) -> None:
+    def __init__(
+        self, db_path: "Optional[Path]" = None, read_only: "bool" = False, *,
+        defer_fts_initialization: "bool" = False,
+    ) -> None:
         from persistence_assembly import profile_scope
 
         self._target: Any
@@ -215,6 +226,7 @@ class _SessionDB:
                     "folder's store with persistence_assembly.open_persistence(profile_scope(home=...))"
                 )
             self._target = _scope_of(db_path)
+        self.db_path = _Path(db_path) if db_path is not None else _default_db_path()
         self.read_only = read_only
         self._lock = _threading.Lock()
         self._calls = 0
@@ -222,6 +234,70 @@ class _SessionDB:
         self._reference: Optional[_weakref.finalize] = None
         self._stack, self._store = self._open()
         self._identity = None if read_only else _file_identity(self._target)
+        self._fts_maintenance_pending = bool(defer_fts_initialization and not read_only)
+        self._fts_maintenance_error: Optional[str] = None
+        if self._fts_maintenance_pending:
+            self._fts_enabled = self._trigram_available = False
+
+    def _sqlite_holder(self) -> "Any":
+        return self._store._bound_store().holder()
+
+    @property
+    def _conn(self) -> "Any":
+        return self._sqlite_holder()._conn
+
+    @property
+    def _fts_enabled(self) -> "bool":
+        return bool(self._sqlite_holder()._fts_enabled)
+
+    @_fts_enabled.setter
+    def _fts_enabled(self, value: "bool") -> None:
+        self._sqlite_holder()._fts_enabled = bool(value)
+
+    @property
+    def _trigram_available(self) -> "bool":
+        return bool(self._sqlite_holder()._trigram_available)
+
+    @_trigram_available.setter
+    def _trigram_available(self, value: "bool") -> None:
+        self._sqlite_holder()._trigram_available = bool(value)
+
+    @property
+    def state_db_maintenance_pending(self) -> "bool":
+        return self._fts_maintenance_pending
+
+    def _fts_table_probe(self, cursor: "Any", table_name: "str") -> "Any":
+        from persistence.sqlite._schema import _fts_table_probe
+
+        return _fts_table_probe(self._sqlite_holder(), cursor, table_name)
+
+    def _init_schema(self) -> None:
+        cursor = self._conn.cursor()
+        self._fts_enabled = self._fts_table_probe(cursor, "messages_fts") is True
+        self._trigram_available = (
+            self._fts_enabled and self._fts_table_probe(cursor, "messages_fts_trigram") is True
+        )
+
+    def run_deferred_startup_maintenance(self, cancel_event: "Any" = None) -> "bool":
+        if not self._fts_maintenance_pending:
+            return True
+        cancel_event = cancel_event or _threading.Event()
+        if cancel_event.is_set():
+            return False
+        holder = self._sqlite_holder()
+        with holder._lock:
+            if cancel_event.is_set():
+                return False
+            self._fts_maintenance_pending = False
+            self._fts_maintenance_error = None
+            try:
+                self._init_schema()
+            except Exception as exc:
+                self._fts_maintenance_pending = True
+                self._fts_enabled = self._trigram_available = False
+                self._fts_maintenance_error = f"{type(exc).__name__}: {exc}"
+                raise
+        return True
 
     def _open(self) -> "tuple[_ExitStack, Any]":
         from persistence_assembly import open_persistence, open_persistence_reader

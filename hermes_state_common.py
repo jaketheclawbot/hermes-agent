@@ -6,3 +6,6 @@ the text so a host on one of those releases can still update.
 """
 
 # CREATE TABLE IF NOT EXISTS session_admissions
+
+# Private compatibility names used by the retained gateway startup-maintenance contract.
+from persistence.sqlite._schema_ddl import SCHEMA_VERSION, _FTS_TRIGGERS
