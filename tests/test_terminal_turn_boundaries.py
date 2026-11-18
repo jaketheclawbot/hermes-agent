@@ -34,11 +34,13 @@ def observed(registry, owner="owner", sid="proc", consumed=True):
 
 
 def real_agent(tmp_path, sid="owner"):
-    db = SessionDB(tmp_path / "receipt.db")
+    db = SessionDB(tmp_path / "receipts" / "state.db")
     db.create_session(sid, source="cli")
     agent = AIAgent.__new__(AIAgent)
     agent.session_id = sid
     agent._session_db = db
+    from agent.agent_init_session import stand_in_interface
+    agent.persistence = stand_in_interface(db)
     agent._session_db_created = True
     agent._last_flushed_db_idx = 0
     agent.max_iterations = 10
@@ -368,7 +370,8 @@ async def test_real_graceful_drain_includes_bounded_notify_not_servers(registry,
 @pytest.mark.parametrize("batch", [False, True])
 def test_executor_construction_failure_removes_phantom_dispatch(monkeypatch, tmp_path, batch):
     import tools.async_delegation as ad
-    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "dispatch.db")
+    from persistence_assembly import profile_scope
+    monkeypatch.setattr(ad, "_scope", lambda: profile_scope(home=tmp_path / "dispatch"))
     monkeypatch.setattr(ad, "_records", {})
     monkeypatch.setattr(ad, "_get_executor", Mock(side_effect=RuntimeError("pool unavailable")))
     worker = Mock(side_effect=AssertionError("must not start"))
@@ -379,8 +382,9 @@ def test_executor_construction_failure_removes_phantom_dispatch(monkeypatch, tmp
     assert result["status"] == "rejected"
     assert not ad._records
     worker.assert_not_called()
-    with ad._transaction() as conn:
-        assert conn.execute("SELECT COUNT(*) FROM async_delegations").fetchone()[0] == 0
+    with ad._ledger() as store:
+        assert store._bound_store().holder()._read_one(
+            "SELECT COUNT(*) FROM async_delegations")[0] == 0
 
 
 @pytest.mark.asyncio
