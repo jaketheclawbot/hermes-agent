@@ -24,25 +24,13 @@ from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent
 from gateway.session import SessionEntry, SessionSource
+from persistence_assembly import open_persistence, profile_scope
+from tests.fixtures.storage_seed import seed_session
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-@pytest.fixture(autouse=True)
-def isolated_session_db_retirement(monkeypatch):
-    """Keep fixture DBs off the CPython ctypes retirement path.
-
-    These tests exercise ordinary close, never lost-WAL retirement.  The real
-    retirement implementation has its own focused coverage; importing ctypes
-    here would unnecessarily cross the isolated runner's dynamic-library gate.
-    """
-    import hermes_state
-
-    monkeypatch.setattr(
-        hermes_state, "_prepare_connection_retirement", lambda: lambda _conn: None
-    )
 
 def _make_history(n_messages: int, content_size: int = 100) -> list:
     """Build a fake transcript with n_messages user/assistant pairs."""
@@ -330,7 +318,7 @@ async def test_session_hygiene_preserves_transcript_when_in_place_configured_but
 @pytest.mark.asyncio
 @pytest.mark.parametrize("warning_notifications", [True, False])
 async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monkeypatch, tmp_path, warning_notifications):
-    """A timed-out SessionDB-bound worker cannot compact after the live turn starts.
+    """A timed-out store-bound worker cannot compact after the live turn starts.
 
     The worker remains alive long enough to cross the old race window. The
     timeout must fence its eventual commit, continue to the live agent, and
@@ -426,6 +414,9 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
     runner._running_agents = {}
     runner._pending_messages = {}
     runner._session_db = SimpleNamespace(_db=fake_db)
+    handle = MagicMock()
+    handle.messages.read_compression_cooldown.return_value = None
+    monkeypatch.setattr(GatewayRunner, "persistence", handle)
     runner._is_user_authorized = lambda _source: True
     runner._set_session_env = lambda _context, **_kwargs: None
     runner._run_agent = AsyncMock(
@@ -463,8 +454,8 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
     assert runner._run_agent.await_count == 1
     # Cooldown must be persisted to the state DB (survives restart, #74136),
     # not stashed in an in-memory dict.
-    assert fake_db.record_compression_failure_cooldown.called
-    _cd_args = fake_db.record_compression_failure_cooldown.call_args[0]
+    assert handle.messages.record_compression_cooldown.called
+    _cd_args = handle.messages.record_compression_cooldown.call_args[0]
     assert _cd_args[0] == "sess-timeout"
     assert _cd_args[1] > time.time()
     timeout_warnings = [s for s in adapter.sent if "took too long" in s["content"]]
@@ -503,7 +494,7 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
 
     The hygiene pass runs before the user turn and already owns the gateway
     session binding, so it should force in-place compaction and bind the
-    compressor to the gateway SessionDB. Otherwise a helper can return a
+    compressor to the gateway's store. Otherwise a helper can return a
     summary without rotating/compacting, the guard preserves the original
     transcript, and the same oversized session is reloaded on every turn.
     """
@@ -517,16 +508,9 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
         "Pinboard provider instructions\n"
         "</memory_provider_context>"
     )
-    fake_db = MagicMock()
-    fake_db.get_compression_failure_cooldown.return_value = None
-    async_session_db = SimpleNamespace(
-        _db=fake_db,
-        get_session=AsyncMock(
-            return_value={
-                "system_prompt": stored_system_prompt,
-            }
-        ),
-    )
+    handle = MagicMock()
+    handle.messages.read_compression_cooldown.return_value = None
+    handle.aio.sessions.get = AsyncMock(return_value=SimpleNamespace(system_prompt=stored_system_prompt))
 
     class FakeInPlaceCompressAgent:
         last_instance = None
@@ -535,7 +519,7 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
             self.model = kwargs.get("model")
             self.platform = kwargs.get("platform")
             self.session_id = kwargs.get("session_id", "fake-session")
-            self._session_db = kwargs.get("session_db")
+            self.persistence = kwargs.get("persistence")
             self._cached_system_prompt = None
             self.compression_in_place = False
             self._last_compaction_in_place = False
@@ -551,7 +535,7 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
 
         def _compress_context(self, messages, *_args, **_kwargs):
             assert self.compression_in_place is True
-            assert self._session_db is fake_db
+            assert self.persistence is handle
             assert self.platform == "gateway_hygiene"
             assert self._cached_system_prompt == stored_system_prompt
             self._last_compaction_in_place = True
@@ -597,7 +581,8 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
     runner.session_store.append_to_transcript = MagicMock()
     runner._running_agents = {}
     runner._pending_messages = {}
-    runner._session_db = async_session_db
+    runner._session_db = handle
+    monkeypatch.setattr(GatewayRunner, "persistence", handle)
     runner._is_user_authorized = lambda _source: True
     runner._set_session_env = lambda _context, **_kwargs: None
     runner._run_agent = AsyncMock(
@@ -647,8 +632,8 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
     assert result == "ok"
     agent = FakeInPlaceCompressAgent.last_instance
     assert agent is not None
-    async_session_db.get_session.assert_awaited_once_with("sess-1")
-    agent.context_compressor.bind_session_state.assert_called_once_with(fake_db, "sess-1")
+    handle.aio.sessions.get.assert_awaited_once_with("sess-1")
+    agent.context_compressor.bind_session_state.assert_called_once_with(handle, "sess-1", persistence=handle)
     # In-place compaction already persisted via archive_and_compact() —
     # rewrite_transcript would replace_messages(active_only=False) and DELETE
     # the just-archived rows (#61145). The hygiene handler must skip it.
@@ -786,11 +771,21 @@ async def test_session_hygiene_honors_configurable_hard_message_limit(
 # Cooldown persistence across gateway restarts (#74136)
 # ---------------------------------------------------------------------------
 
+# Storage interface handles ``_make_cooldown_runner`` opened; closed after each test.
+_STORAGE_HANDLES = []
+
+
+@pytest.fixture(autouse=True)
+def _close_storage_handles():
+    yield
+    while _STORAGE_HANDLES:
+        _STORAGE_HANDLES.pop().close()
+
+
 def _make_cooldown_runner(monkeypatch, tmp_path, agent_cls, session_db, session_id):
     """Scaffolding for the restart-persistence tests: a fresh GatewayRunner
-    wired to a REAL AsyncSessionDB facade (not a MagicMock) so the hygiene
+    wired to a REAL store handle (not a MagicMock) so the hygiene
     cooldown check/write paths exercise the actual SQLite-backed methods."""
-    from hermes_state import AsyncSessionDB
     # Isolate hygiene timing/SQLite behavior from unrelated cold plugin discovery.
     # The real async DB and commit-fence operations below remain exercised.
     import hermes_cli.lifecycle as lifecycle
@@ -801,7 +796,6 @@ def _make_cooldown_runner(monkeypatch, tmp_path, agent_cls, session_db, session_
     import hermes_cli.config as cli_config
     fixture_config = cli_config.load_config()
     monkeypatch.setattr(cli_config, "load_config", lambda *_a, **_kw: copy.deepcopy(fixture_config))
-
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
@@ -844,10 +838,13 @@ def _make_cooldown_runner(monkeypatch, tmp_path, agent_cls, session_db, session_
     runner.session_store.append_to_transcript = MagicMock()
     runner._running_agents = {}
     runner._pending_messages = {}
-    # The real async facade over the real SQLite-backed SessionDB — the
-    # production shape.  A SimpleNamespace(_db=MagicMock()) here would let
+    # The caller's real SQLite-backed store handle, the production shape.
+    # A SimpleNamespace(_db=MagicMock()) here would let
     # the assertion pass against methods that don't actually persist.
-    runner._session_db = AsyncSessionDB(session_db)
+    runner._session_db = session_db
+    # ...and beside it the storage interface handle on the same state.db, which the cooldown check reads.
+    _STORAGE_HANDLES.append(open_persistence(profile_scope(home=tmp_path)))
+    monkeypatch.setattr(GatewayRunner, "persistence", _STORAGE_HANDLES[-1])
     runner._is_user_authorized = lambda _source: True
     runner._set_session_env = lambda _context, **_kwargs: None
     runner._run_agent = AsyncMock(
@@ -882,7 +879,7 @@ def _make_cooldown_runner(monkeypatch, tmp_path, agent_cls, session_db, session_
 
 @pytest.mark.asyncio
 async def test_hygiene_compression_cooldown_survives_gateway_restart(
-    monkeypatch, tmp_path, isolated_session_db_retirement
+    monkeypatch, tmp_path
 ):
     """Regression for #74136: the compression-failure cooldown must be
     persisted to the state DB, not an in-memory dict on the runner.
@@ -892,13 +889,11 @@ async def test_hygiene_compression_cooldown_survives_gateway_restart(
     assert the second runner still honors the cooldown — i.e. it does not
     re-instantiate a compression agent for the same failing session.
     """
-    from hermes_state import SessionDB
-
     gateway_run = importlib.import_module("gateway.run")
     session_id = "sess-restart"
-    db = SessionDB(db_path=tmp_path / "state.db")
+    db = open_persistence(profile_scope(home=tmp_path))
     try:
-        db.create_session(session_id, "telegram")
+        seed_session(db, session_id, "telegram")
 
         main_thread = threading.get_ident()
         streak_threads = []
@@ -945,8 +940,9 @@ async def test_hygiene_compression_cooldown_survives_gateway_restart(
         assert streak_threads[0] != main_thread
 
         # The abort must have persisted a cooldown to the DB.
-        state = db.get_compression_failure_cooldown(session_id)
-        assert state is not None and state["remaining_seconds"] > 0, (
+        now = time.time()
+        state = db.messages.read_compression_cooldown(session_id, now)
+        assert state is not None and state.until - now > 0, (
             "hygiene compression abort did not persist a cooldown to the "
             f"state DB; got {state!r}"
         )
@@ -985,7 +981,7 @@ async def test_hygiene_compression_cooldown_survives_gateway_restart(
 
         # Once the first deadline expires, the next failed attempt after a
         # restart must use rung 2 (900s), not start over at 300s (#86650).
-        db.clear_compression_failure_cooldown(session_id)
+        db.messages.clear_compression_cooldown(session_id)
         runner3, _adapter3, event3 = _make_cooldown_runner(
             monkeypatch, tmp_path, AbortingCompressAgent, db, session_id
         )
@@ -993,9 +989,10 @@ async def test_hygiene_compression_cooldown_survives_gateway_restart(
         assert AbortingCompressAgent.instances == 2
         assert len(streak_threads) == 2
         assert all(thread_id != main_thread for thread_id in streak_threads)
-        escalated = db.get_compression_failure_cooldown(session_id)
+        now = time.time()
+        escalated = db.messages.read_compression_cooldown(session_id, now)
         assert escalated is not None
-        assert escalated["remaining_seconds"] == pytest.approx(900, abs=5)
+        assert escalated.until - now == pytest.approx(900, abs=5)
     finally:
         db.close()
 
@@ -1006,7 +1003,7 @@ async def test_hygiene_compression_cooldown_survives_gateway_restart(
 
 @pytest.mark.asyncio
 async def test_hygiene_fence_cancel_records_cooldown_without_abort_flag(
-    monkeypatch, tmp_path, isolated_session_db_retirement
+    monkeypatch, tmp_path
 ):
     """A fence-cancelled hygiene worker returns the original transcript with
     ``_last_compress_aborted`` still False (failure_class=commit_fence_cancelled).
@@ -1014,8 +1011,6 @@ async def test_hygiene_fence_cancel_records_cooldown_without_abort_flag(
     That used to skip the abort-cooldown block, so the next turn immediately
     re-armed hygiene and waited up to the 600s ceiling behind a doomed attempt.
     """
-    from hermes_state import SessionDB
-
     session_id = "sess-fence-cancel"
 
     class FenceCancelCompressAgent:
@@ -1040,16 +1035,17 @@ async def test_hygiene_fence_cancel_records_cooldown_without_abort_flag(
                 assert commit_fence.try_cancel_before_commit() is True
             return (messages, None)
 
-    db = SessionDB(db_path=tmp_path / "state.db")
+    db = open_persistence(profile_scope(home=tmp_path))
     try:
-        db.create_session(session_id, "telegram")
+        seed_session(db, session_id, "telegram")
         runner1, adapter1, event1 = _make_cooldown_runner(
             monkeypatch, tmp_path, FenceCancelCompressAgent, db, session_id
         )
         assert await runner1._handle_message(event1) == "ok"
         assert FenceCancelCompressAgent.instances == 1
-        state = db.get_compression_failure_cooldown(session_id)
-        assert state is not None and state["remaining_seconds"] > 0, (
+        now = time.time()
+        state = db.messages.read_compression_cooldown(session_id, now)
+        assert state is not None and state.until - now > 0, (
             "fence-cancelled hygiene compression did not persist a cooldown; "
             f"got {state!r}"
         )
@@ -1088,11 +1084,9 @@ async def test_hygiene_fence_cancel_records_cooldown_without_abort_flag(
 
 @pytest.mark.asyncio
 async def test_hygiene_skips_when_compression_already_in_flight(
-    monkeypatch, tmp_path, isolated_session_db_retirement
+    monkeypatch, tmp_path
 ):
     """Do not spawn a sibling hygiene compressor while a lock is already held."""
-    from hermes_state import SessionDB
-
     session_id = "sess-in-flight"
 
     class ShouldNotRunAgent:
@@ -1111,9 +1105,9 @@ async def test_hygiene_skips_when_compression_already_in_flight(
         def _compress_context(self, messages, *_args, **_kwargs):
             return (messages, None)
 
-    db = SessionDB(db_path=tmp_path / "state.db")
+    db = open_persistence(profile_scope(home=tmp_path))
     try:
-        db.create_session(session_id, "telegram")
+        seed_session(db, session_id, "telegram")
         runner, _adapter, event = _make_cooldown_runner(
             monkeypatch, tmp_path, ShouldNotRunAgent, db, session_id
         )
@@ -1163,10 +1157,8 @@ def _turn_payload(runner):
 
 def _make_bound_runner(monkeypatch, tmp_path, agent_cls, cfg_text, transcript):
     """``_make_cooldown_runner`` with a >hard-limit transcript and a lowered hard limit."""
-    from hermes_state import SessionDB
-
-    db = SessionDB(db_path=tmp_path / "state.db")
-    db.create_session("sess-bound", "telegram")
+    db = open_persistence(profile_scope(home=tmp_path))
+    seed_session(db, "sess-bound", "telegram")
     runner, adapter, event = _make_cooldown_runner(
         monkeypatch, tmp_path, agent_cls, db, "sess-bound"
     )
@@ -1289,7 +1281,7 @@ async def test_hygiene_miss_bounds_the_model_payload(monkeypatch, tmp_path):
 
         # Control: a LANDED hygiene commit is adopted as-is — its 25 summary rows exceed the
         # limit, and the bound must not touch them (only the unlanded path is clipped).
-        db.create_session("sess-landed", "telegram")
+        seed_session(db, "sess-landed", "telegram")
         runner2, _adapter2, event2 = _make_cooldown_runner(
             monkeypatch, tmp_path, _LandedCompressAgent, db, "sess-landed"
         )

@@ -1354,12 +1354,13 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         timeout: int = 10, owner_task_id: str = "", persist_on_release: bool = False,
         notify_on_complete: bool = False,
         notification_origin: Optional[dict[str, Any]] = None,
+        allow_cwd_fallback: bool = False,
     ) -> ProcessSession:
-        """Spawn a background process inside a non-local backend's sandbox.
-        The command is wrapped to capture its in-sandbox PID and redirect output to a
-        log file that later execute() calls poll. No live pipe or stdin, but it runs in
-        the correct sandbox context. ``persist_on_release`` keeps the process out of
-        agent-lifecycle kill sweeps (#41225)."""
+        """Spawn inside a non-local backend and poll its redirected log.
+
+        ``persist_on_release`` keeps it out of lifecycle sweeps; ``allow_cwd_fallback``
+        is ``execute``'s and records the selected fallback on the session.
+        """
         session = self._new_session(
             command, task_id, owner_task_id, session_key, cwd,
             env_ref=env, pid_scope="sandbox",
@@ -1375,7 +1376,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
             f"( nohup bash -lc {q(command)} > {q(log_path)} 2>&1; "
             f"rc=$?; printf '%s\\n' \"$rc\" > {q(exit_path)} ) & "
             f"echo $! > {q(pid_path)} && cat {q(pid_path)}")
-        result = env.execute(bg_command, cwd=cwd or "", timeout=timeout, rewrite_compound_background=False)
+        result = env.execute(bg_command, cwd=cwd or "", timeout=timeout, rewrite_compound_background=False, allow_cwd_fallback=allow_cwd_fallback)
+        session.cwd = (result.get("cwd_fallback") or {}).get("used") or session.cwd
         output = result.get("output", "").strip()
         session.pid = next((int(ln) for ln in map(str.strip, output.splitlines()) if ln.isdigit()), None)
         # No PID from the wrapper (no bash in the image, sandbox gone, broken redirect): the
@@ -1389,7 +1391,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         except Exception:
             # This PID belongs to the sandbox namespace, never signal it on the host.
             with suppress(Exception):
-                env.execute(f"kill {session.pid} 2>/dev/null", timeout=5)
+                env.execute(f"kill {session.pid} 2>/dev/null", cwd="/", timeout=5)
             raise
         return session
 
@@ -1521,9 +1523,9 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
             time.sleep(2)
             try:
                 # Read only the bytes written since the last poll, plus the process status.
-                raw = env.execute(
+                raw = env.execute(  # absolute paths only: "/" survives the job deleting its cwd
                     log_delta_command(q(log_path), prev_output_bytes, q(pid_path), q(exit_path)),
-                    timeout=10).get("output", "")
+                    cwd="/", timeout=10).get("output", "")
                 reply = parse_log_delta_reply(raw)
                 delta = reply.delta if reply else ""
                 if reply:
@@ -2478,7 +2480,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
             # leaves Git Bash descendants behind.
             self._terminate_host_pid(session.process.pid, session.host_start_time)
         elif session.env_ref and session.pid:
-            session.env_ref.execute(f"kill {session.pid} 2>/dev/null", timeout=5)
+            session.env_ref.execute(f"kill {session.pid} 2>/dev/null", cwd="/", timeout=5)
         elif session.detached and session.pid_scope == "host" and session.pid:
             # Same fate as poll/list: a gone or reused PID means our process is
             # gone — never tree-kill the stranger — but a live PID with an
