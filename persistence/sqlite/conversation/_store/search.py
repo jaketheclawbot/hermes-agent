@@ -623,7 +623,7 @@ def _search_messages_impl(
         matches = _search_messages_like_fallback(holder, query, limit=limit, offset=offset, sort=sort, **filters)
         return _finalize_search_matches(holder, matches, result_fields=result_fields)
     _refresh_fts_stale_state(holder)
-    if holder._fts_stale:
+    if holder._fts_stale or getattr(holder, "_fts_maintenance_pending", False):
         matches = _search_messages_like_fallback(holder, query, limit=limit, offset=offset, sort=sort, **filters)
         return _finalize_search_matches(holder, matches, result_fields=result_fields)
     if not holder._fts_enabled:

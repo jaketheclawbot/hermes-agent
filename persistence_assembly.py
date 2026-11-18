@@ -201,13 +201,15 @@ def _release_shared(key: str, entry: list[Any]) -> None:
         entry[0].close()
 
 
-def open_persistence(scope: ProfileScope, *, eager: bool = False) -> Persistence:
+def open_persistence(scope: ProfileScope, *, eager: bool = False, defer_fts_initialization: bool = False) -> Persistence:
     """A handle on ``scope``'s process-shared store.
 
     Every handle on one profile shares one backend, whose store is the registry's single writer for that file. The
     first use of a handle reads the configured provider and assembles the profile's backend when no handle did yet,
     raising ``ValueError`` for an unknown provider. With ``eager`` that use and the store's open happen here, so an
     unopenable store raises its typed error at acquisition."""
+    if defer_fts_initialization and not eager:
+        raise ValueError("deferred search initialization requires eager canonical persistence")
     key = scope.hermes_home_key
     with _cache_lock:
         entry = _shared.setdefault(key, [None, 0])
@@ -216,7 +218,13 @@ def open_persistence(scope: ProfileScope, *, eager: bool = False) -> Persistence
                               release=lambda: _release_shared(key, entry))
     if eager:
         try:
-            persistence.ready()
+            # A context-local policy affects only newly constructed generations.
+            from persistence.sqlite._holder import _defer_fts_open
+            token = _defer_fts_open.set(defer_fts_initialization)
+            try:
+                persistence.ready()
+            finally:
+                _defer_fts_open.reset(token)
         except BaseException:
             persistence.close()
             raise

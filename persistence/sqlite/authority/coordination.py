@@ -441,6 +441,11 @@ class SQLiteCoordinationRepository(DeliveryObligationVerbs, SubagentLedgerVerbs)
                                    origin_session_id: str = '') -> None:
         now = time.time()
         def _do(conn):
+            # Admission and insertion share BEGIN IMMEDIATE across all processes.
+            if conn.execute(
+                "SELECT COUNT(*) FROM async_delegations WHERE delivery_state!='delivered'"
+            ).fetchone()[0] >= DELEGATION_MAX_DURABLE_PENDING:
+                raise AuthorityRefusal("delegation_backlog_full")
             conn.execute("""INSERT OR REPLACE INTO async_delegations
                    (delegation_id, origin_session, origin_ui_session_id,
                     parent_session_id, state, dispatched_at, updated_at,
@@ -454,31 +459,22 @@ class SQLiteCoordinationRepository(DeliveryObligationVerbs, SubagentLedgerVerbs)
             self._ledger_write(_do)
 
     def prune_delegation_ledger(self) -> None:
-        """Bound terminal history, preferring delivered records for deletion. A unit a waiting child reports on is
-        kept out of the retention and the terminal cap (``KEEP_WAITING_UNITS_SQL``), not the pending cap."""
+        """Bound acknowledged history only; unresolved evidence is admission capacity, never eviction."""
         cutoff = time.time() - DELEGATION_RETENTION_SECONDS
         keep = KEEP_WAITING_UNITS_SQL
         def _do(conn):
             conn.execute(
                 "DELETE FROM async_delegations WHERE delivery_state='delivered' AND updated_at < ?" + keep, (cutoff,))
             terminal_count = conn.execute(
-                "SELECT COUNT(*) FROM async_delegations WHERE state!='running'" + keep
+                "SELECT COUNT(*) FROM async_delegations WHERE delivery_state='delivered'" + keep
             ).fetchone()[0]
             if terminal_count > DELEGATION_MAX_RETAINED_TERMINAL:
                 conn.execute(f"""DELETE FROM async_delegations WHERE delegation_id IN (
                          SELECT delegation_id FROM async_delegations
-                         WHERE state!='running'{keep}
-                         ORDER BY CASE delivery_state WHEN 'delivered' THEN 0 ELSE 1 END,
-                                  updated_at ASC LIMIT ?
+                         WHERE delivery_state='delivered'{keep}
+                         ORDER BY updated_at ASC, delegation_id LIMIT ?
                        )""", (terminal_count - DELEGATION_MAX_RETAINED_TERMINAL,))
-            pending_count = conn.execute("""SELECT COUNT(*) FROM async_delegations
-                   WHERE state!='running' AND delivery_state='pending'""").fetchone()[0]
-            if pending_count > DELEGATION_MAX_DURABLE_PENDING:
-                conn.execute("""DELETE FROM async_delegations WHERE delegation_id IN (
-                         SELECT delegation_id FROM async_delegations
-                         WHERE state!='running' AND delivery_state='pending'
-                         ORDER BY updated_at ASC LIMIT ?
-                       )""", (pending_count - DELEGATION_MAX_DURABLE_PENDING,))
+
         with translated():
             self._ledger_write(_do)
 

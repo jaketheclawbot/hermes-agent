@@ -19,6 +19,7 @@ from hermes_state_registry import (
     release_shared_session_db,
 )
 from hermes_state_common import _FTS_TRIGGERS, SCHEMA_VERSION
+from persistence.sqlite import _schema as sqlite_schema
 
 
 class _ConnectedAdapter(BasePlatformAdapter):
@@ -109,7 +110,7 @@ async def test_adapter_connect_precedes_blocked_current_schema_fts_probe_and_wri
     connected = threading.Event()
     probe_started = threading.Event()
     release_probe = threading.Event()
-    original_probe = SessionDB._fts_table_probe
+    original_probe = sqlite_schema._fts_table_probe
 
     def blocked_ordinary_probe(self, cursor, table_name):
         assert connected.is_set(), "ordinary FTS probing ran before adapter connect"
@@ -119,7 +120,7 @@ async def test_adapter_connect_precedes_blocked_current_schema_fts_probe_and_wri
 
     # This probe runs on every healthy current-schema open. It is not a
     # missing-trigger or stale-index rebuild seam.
-    monkeypatch.setattr(SessionDB, "_fts_table_probe", blocked_ordinary_probe)
+    monkeypatch.setattr(sqlite_schema, "_fts_table_probe", blocked_ordinary_probe)
     config = GatewayConfig(
         platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="***")},
         sessions_dir=tmp_path / "sessions",
@@ -215,6 +216,27 @@ async def test_background_fts_failure_degrades_search_not_platforms(
         db.close()
 
 
+def test_actual_profile_store_opens_deferred_and_snapshot_finds_secondary(monkeypatch, tmp_path):
+    from gateway.session import SessionStore
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    store = SessionStore(tmp_path / "sessions", GatewayConfig(sessions_dir=tmp_path / "sessions"), defer_fts_initialization=True)
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.session_store = store
+    try:
+        primary = store._open_persistence_for_active_scope()
+        secondary = store._open_persistence_for_active_scope(home=tmp_path / "secondary")
+        holders = [primary._bound_store().holder(), secondary._bound_store().holder()]
+        assert all(holder.state_db_maintenance_pending for holder in holders)
+        assert all(not holder._fts_enabled for holder in holders)
+        snapshot = runner._state_db_handles_snapshot()
+        assert all(holder in snapshot for holder in holders)
+        for holder in holders:
+            assert holder.run_deferred_startup_maintenance(threading.Event())
+            assert not holder.state_db_maintenance_pending
+    finally:
+        store.close_all_db_handles()
+
+
 def test_search_status_update_preserves_unavailable_core_store(monkeypatch, tmp_path):
     from gateway import status
 
@@ -238,7 +260,7 @@ def test_existing_shared_generation_does_not_duplicate_or_force_maintenance(
     tmp_path,
 ):
     path = tmp_path / "state.db"
-    normal_path = tmp_path / "normal-first.db"
+    normal_path = tmp_path / "normal-first" / "state.db"
     close_shared_session_dbs()
     normal_first = get_shared_session_db(normal_path)
     first = get_shared_session_db(path, defer_fts_initialization=True)
@@ -253,7 +275,7 @@ def test_existing_shared_generation_does_not_duplicate_or_force_maintenance(
 
         first.run_deferred_startup_maintenance(threading.Event())
         monkeypatch.setattr(
-            SessionDB,
+            sqlite_schema,
             "_fts_table_probe",
             lambda *_args: pytest.fail(
                 "gateway acquire repeated completed maintenance"

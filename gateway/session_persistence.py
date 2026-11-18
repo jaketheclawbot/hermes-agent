@@ -129,7 +129,8 @@ class SessionPersistenceMixin:
 
         def _open():
             try:
-                return open_persistence(scope, eager=True)
+                return open_persistence(scope, eager=True,
+                    defer_fts_initialization=getattr(self, "_defer_fts_initialization", False))
             except Exception as e:
                 if not _is_live_system_guard(e):
                     print(f"[gateway] Warning: SQLite session store unavailable, falling back to JSONL: {e}")

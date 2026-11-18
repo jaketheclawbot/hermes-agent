@@ -3595,6 +3595,8 @@ class GatewayRunner(
         primary = getattr(store, "_db", None)
         if primary is not None:
             handles.append(primary)
+        from persistence_assembly import Persistence
+        handles = [db._bound_store().holder() if isinstance(db, Persistence) else db for db in handles]
         seen: set[int] = set()
         return [db for db in handles if db is not None and not (id(db) in seen or seen.add(id(db)))]
 

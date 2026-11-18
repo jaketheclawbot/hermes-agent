@@ -7,10 +7,20 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from contextlib import contextmanager
 from unittest.mock import patch
 
 from tools import process_registry as pr
 from tools import async_delegation as ad
+from persistence_assembly import profile_scope
+
+
+@contextmanager
+def _test_transaction():
+    with ad._ledger() as store:
+        holder = store._bound_store().holder()
+        with holder._lock, holder._conn:
+            yield holder._conn
 
 
 class PonytailDurabilityTests(unittest.TestCase):
@@ -242,9 +252,9 @@ class PonytailDurabilityTests(unittest.TestCase):
 
     def test_durable_backlog_rejects_without_phantom_running_record(self):
         db = Path(self.tmp.name) / "state.db"
-        with patch.object(ad, "_db_path", lambda: db), \
-             patch.object(ad, "_MAX_DURABLE_PENDING", 1):
-            with ad._transaction() as conn:
+        with patch.object(ad, "_scope", lambda: profile_scope(home=db.parent)), \
+             patch("persistence.sqlite.authority.coordination.DELEGATION_MAX_DURABLE_PENDING", 1):
+            with _test_transaction() as conn:
                 now = time.time()
                 conn.execute(
                     "INSERT INTO async_delegations "
@@ -257,7 +267,7 @@ class PonytailDurabilityTests(unittest.TestCase):
             )
             self.assertEqual(result["status"], "rejected")
             self.assertEqual(set(ad._records), before)
-            with ad._transaction() as conn:
+            with _test_transaction() as conn:
                 self.assertEqual(conn.execute(
                     "SELECT COUNT(*) FROM async_delegations"
                 ).fetchone()[0], 1)
@@ -274,15 +284,41 @@ class PonytailDurabilityTests(unittest.TestCase):
         self.assertIn("disk full", result["error"])
         self.assertEqual(set(ad._records), before)
 
+    def test_storage_pruning_preserves_pending_and_dropped_over_history_cap(self):
+        db = Path(self.tmp.name) / "state.db"
+        with patch.object(ad, "_scope", lambda: profile_scope(home=db.parent)), \
+             patch("persistence.sqlite.authority.coordination.DELEGATION_MAX_RETAINED_TERMINAL", 1), \
+             patch("persistence.sqlite.authority.coordination.DELEGATION_MAX_DURABLE_PENDING", 1):
+            with _test_transaction() as conn:
+                for i, delivery in enumerate(("pending", "pending", "dropped", "delivered", "delivered")):
+                    conn.execute("INSERT INTO async_delegations "
+                        "(delegation_id,origin_session,state,dispatched_at,updated_at,delivery_state) "
+                        "VALUES (?,'owner','completed',?,?,?)", (str(i), time.time(), time.time(), delivery))
+            for _ in range(2):
+                ad._prune_durable_records()
+            with _test_transaction() as conn:
+                rows = dict(conn.execute("SELECT delegation_id,delivery_state FROM async_delegations"))
+            self.assertEqual({key: rows[key] for key in ("0", "1", "2")},
+                             {"0": "pending", "1": "pending", "2": "dropped"})
+            self.assertEqual(list(rows.values()).count("delivered"), 1)
+            self.assertFalse(ad._persist_dispatch({"delegation_id": "new", "session_key": "owner", "dispatched_at": time.time()}))
+
     def test_capacity_admission_is_atomic_across_processes(self):
         db = Path(self.tmp.name) / "state.db"
+        from persistence_assembly import open_persistence
+        # Keep the shared WAL generation alive while independent children race
+        # admission; close-time lifecycle is a separate storage contract.
+        anchor = open_persistence(profile_scope(home=db.parent), eager=True)
+        self.addCleanup(anchor.close)
         start = Path(self.tmp.name) / "start"
         code = r'''
 import json, os, sys, time
 from pathlib import Path
 from tools import async_delegation as ad
-ad._db_path = lambda: Path(sys.argv[1])
-ad._MAX_DURABLE_PENDING = 1
+from persistence_assembly import profile_scope
+from persistence.sqlite.authority import coordination
+ad._scope = lambda: profile_scope(home=Path(sys.argv[1]).parent)
+coordination.DELEGATION_MAX_DURABLE_PENDING = 1
 while not Path(sys.argv[2]).exists(): time.sleep(.005)
 record = {"delegation_id": sys.argv[3], "session_key": "owner",
           "dispatched_at": time.time(), "goal": "g"}
@@ -311,21 +347,17 @@ print(json.dumps(ad._persist_dispatch(record)))
 
     def test_schema_cache_detects_database_replacement_at_same_path(self):
         db = Path(self.tmp.name) / "state.db"
-        with patch.object(ad, "_db_path", lambda: db):
-            ad._SCHEMA_INITIALIZED_PATHS.clear()
-            conn = ad._connect()
-            conn.close()
+        with patch.object(ad, "_scope", lambda: profile_scope(home=db.parent)):
+            with _test_transaction() as conn:
+                self.assertTrue(conn.execute("SELECT 1 FROM sqlite_master WHERE name='async_delegations'").fetchone())
             old = db.with_suffix(".old")
             db.rename(old)
             replacement = __import__("sqlite3").connect(db)
             replacement.close()
-            conn = ad._connect()
-            try:
-                self.assertEqual(conn.execute(
+            with _test_transaction() as conn:
+                self.assertEqual(tuple(conn.execute(
                     "SELECT name FROM sqlite_master WHERE name='async_delegations'"
-                ).fetchone(), ("async_delegations",))
-            finally:
-                conn.close()
+                ).fetchone()), ("async_delegations",))
 
 
 if __name__ == "__main__":

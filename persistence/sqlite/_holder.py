@@ -24,8 +24,11 @@ import uuid
 import weakref
 from collections import deque
 from contextlib import contextmanager, suppress
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional, TypeVar, cast
+
+_defer_fts_open = ContextVar("defer_fts_open", default=False)
 
 from hermes_constants import mkdir_under_hermes_home
 from persistence.sqlite._state.common import escape_like as _escape_like, stat_db_file_identity as _stat_db_file_identity
@@ -299,6 +302,9 @@ class StoreHolder:
     def __init__(self, db_path: Path, read_only: bool = False, *, creation_site: Optional[str] = None,
                  read_patience_s: Optional[float] = None):
         self.db_path = db_path
+        self._defer_fts_initialization = _defer_fts_open.get() and not read_only
+        self._fts_maintenance_pending = False
+        self._fts_maintenance_error = None
         _ensure_test_isolation(self.db_path)  # before any connection/pragma/mkdir
         self.read_only = read_only
         # The lock wait a read-only holder opens its one connection with; the reads it serves inherit it.
@@ -396,6 +402,37 @@ class StoreHolder:
                 # Test-isolation runs only (gated inside the helper): register
                 # for the suite-level leak sweep in tests/conftest.py.
                 _register_test_instance(self)
+
+    @property
+    def state_db_maintenance_pending(self) -> bool:
+        return self._fts_maintenance_pending
+
+    def run_deferred_startup_maintenance(self, cancel_event=None, *, work=None) -> bool:
+        if not self._fts_maintenance_pending:
+            return True
+        cancel_event = cancel_event or threading.Event()
+        with self._lock:
+            if self.read_only or self._conn is None or cancel_event.is_set():
+                return False
+            self._fts_maintenance_pending = False
+            self._fts_maintenance_error = None
+            previous = self._defer_fts_initialization
+            self._defer_fts_initialization = False
+            self._conn.set_progress_handler(lambda: int(cancel_event.is_set()), 1000)
+            try:
+                work() if work is not None else _init_schema(self)
+            except Exception as exc:
+                self._fts_maintenance_pending = True
+                self._fts_enabled = self._trigram_available = False
+                self._conn.rollback()
+                if isinstance(exc, sqlite3.Error) and cancel_event.is_set() and "interrupt" in str(exc).lower():
+                    return False
+                self._fts_maintenance_error = f"{type(exc).__name__}: {exc}"
+                raise
+            finally:
+                self._conn.set_progress_handler(None, 0)
+                self._defer_fts_initialization = previous
+            return not self._fts_maintenance_pending
 
     def _open_writer(self) -> None:
         """Writable open: preflight, zero-byte quarantine, connect + schema (one in-place repair of a

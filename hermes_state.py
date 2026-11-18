@@ -232,12 +232,10 @@ class _SessionDB:
         self._calls = 0
         self._closed = False
         self._reference: Optional[_weakref.finalize] = None
+        self._defer_fts_initialization = defer_fts_initialization
         self._stack, self._store = self._open()
         self._identity = None if read_only else _file_identity(self._target)
-        self._fts_maintenance_pending = bool(defer_fts_initialization and not read_only)
-        self._fts_maintenance_error: Optional[str] = None
-        if self._fts_maintenance_pending:
-            self._fts_enabled = self._trigram_available = False
+
 
     def _sqlite_holder(self) -> "Any":
         return self._store._bound_store().holder()
@@ -264,7 +262,11 @@ class _SessionDB:
 
     @property
     def state_db_maintenance_pending(self) -> "bool":
-        return self._fts_maintenance_pending
+        return self._sqlite_holder()._fts_maintenance_pending
+
+    @property
+    def fts_maintenance_error(self) -> "Optional[str]":
+        return self._sqlite_holder()._fts_maintenance_error
 
     def _fts_table_probe(self, cursor: "Any", table_name: "str") -> "Any":
         from persistence.sqlite._schema import _fts_table_probe
@@ -272,32 +274,12 @@ class _SessionDB:
         return _fts_table_probe(self._sqlite_holder(), cursor, table_name)
 
     def _init_schema(self) -> None:
-        cursor = self._conn.cursor()
-        self._fts_enabled = self._fts_table_probe(cursor, "messages_fts") is True
-        self._trigram_available = (
-            self._fts_enabled and self._fts_table_probe(cursor, "messages_fts_trigram") is True
-        )
+        from persistence.sqlite._schema import _init_schema
+        _init_schema(self._sqlite_holder())
 
     def run_deferred_startup_maintenance(self, cancel_event: "Any" = None) -> "bool":
-        if not self._fts_maintenance_pending:
-            return True
-        cancel_event = cancel_event or _threading.Event()
-        if cancel_event.is_set():
-            return False
         holder = self._sqlite_holder()
-        with holder._lock:
-            if cancel_event.is_set():
-                return False
-            self._fts_maintenance_pending = False
-            self._fts_maintenance_error = None
-            try:
-                self._init_schema()
-            except Exception as exc:
-                self._fts_maintenance_pending = True
-                self._fts_enabled = self._trigram_available = False
-                self._fts_maintenance_error = f"{type(exc).__name__}: {exc}"
-                raise
-        return True
+        return holder.run_deferred_startup_maintenance(cancel_event, work=self._init_schema)
 
     def _open(self) -> "tuple[_ExitStack, Any]":
         from persistence_assembly import open_persistence, open_persistence_reader
@@ -310,7 +292,8 @@ class _SessionDB:
                 store = stack.enter_context(open_persistence_reader(self._target))
                 store.ready()
             else:
-                store = stack.enter_context(open_persistence(self._target, eager=True))
+                store = stack.enter_context(open_persistence(self._target, eager=True,
+                    defer_fts_initialization=self._defer_fts_initialization))
         except BaseException:
             stack.close()
             raise

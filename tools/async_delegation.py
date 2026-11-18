@@ -155,6 +155,7 @@ def _capture_routing_origin() -> dict[str, Any]:
 def _persist_dispatch(record: dict[str, Any]) -> bool:
     if remote := worker_ledger():
         return bool(remote.dispatch(record))
+    _prune_durable_records()
     try:
         from gateway.status import get_process_start_time
         owner_started_at = get_process_start_time(os.getpid())
@@ -168,24 +169,27 @@ def _persist_dispatch(record: dict[str, Any]) -> bool:
         task_payload["owner_cwd"] = os.getcwd()
     except OSError:
         pass
-    with _DB_LOCK, _ledger() as store:
-        store.coordination.record_delegation_dispatch(
-            delegation_id=record["delegation_id"], origin_session=record.get("session_key", ""),
-            origin_ui_session_id=record.get("origin_ui_session_id", ""),
-            parent_session_id=record.get("parent_session_id"), dispatched_at=record["dispatched_at"],
-            owner=OwnerStamp(pid=os.getpid(), started_at=owner_started_at), task=task_payload,
-            origin_session_id=record.get("origin_session_id", ""))
+    from persistence.core.errors import AuthorityRefusal
+    try:
+        with _DB_LOCK, _ledger() as store:
+            store.coordination.record_delegation_dispatch(
+                delegation_id=record["delegation_id"], origin_session=record.get("session_key", ""),
+                origin_ui_session_id=record.get("origin_ui_session_id", ""),
+                parent_session_id=record.get("parent_session_id"), dispatched_at=record["dispatched_at"],
+                owner=OwnerStamp(pid=os.getpid(), started_at=owner_started_at), task=task_payload,
+                origin_session_id=record.get("origin_session_id", ""))
+    except AuthorityRefusal as exc:
+        if exc.reason != "delegation_backlog_full":
+            raise
+        return False
     return True
 
 
 def _prune_durable_records() -> None:
-    """Retain ledger rows until the storage contract can prune acknowledged rows only.
-
-    The backend's legacy pruning verb also drops pending terminal outcomes over its
-    cap. Calling it here would erase the only durable copy before the parent accepts
-    delivery, so dispatch deliberately leaves pruning to an acceptance-aware owner.
-    """
+    """Bound acknowledged history without erasing unresolved result evidence."""
     require_ledger_owner()
+    with _DB_LOCK, _ledger() as store:
+        store.coordination.prune_delegation_ledger()
 
 
 def _persist_completion(event: dict[str, Any], result: dict[str, Any], *, delivery: str = "pending") -> None:

@@ -1030,7 +1030,13 @@ def _init_schema(holder: StoreHolder):
         LEGACY_REFUSAL_REPAIR_DONE, advance_legacy_refusal_repair,
     )
     cursor = holder._conn.cursor()
-    cursor.executescript(SCHEMA_SQL)
+    if getattr(holder, "_defer_fts_initialization", False):
+        # Canonical tables/columns stay synchronous; derived index scans do not.
+        import re
+        cursor.executescript(re.sub(r"^CREATE (?:UNIQUE )?INDEX\b.*?;", "", SCHEMA_SQL,
+                                    flags=re.MULTILINE | re.DOTALL))
+    else:
+        cursor.executescript(SCHEMA_SQL)
     # Before the table rebuilds below: renaming a table re-parses every trigger, and the retired
     # index's triggers name a tokenizer this process cannot load.
     if drop_retired_cjk_index(cursor):
@@ -1048,6 +1054,12 @@ def _init_schema(holder: StoreHolder):
     # Same PK-rebuild constraint as gateway_routing above.
     _heal_session_model_usage_pk(holder, cursor)
     _heal_reset_rows_carrying_a_delegate_marker(holder, cursor)
+
+    if getattr(holder, "_defer_fts_initialization", False):
+        holder._fts_maintenance_pending = True
+        holder._fts_enabled = holder._trigram_available = False
+        holder._conn.commit()
+        return
 
     # Indexes referencing reconciler-added columns must be created AFTER _reconcile_columns
     # (in SCHEMA_SQL the executescript would fail on legacy DBs).
