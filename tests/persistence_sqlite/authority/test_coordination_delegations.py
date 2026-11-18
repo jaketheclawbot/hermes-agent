@@ -160,6 +160,8 @@ def test_dispatch_then_prune(backend, scope_a, monkeypatch):
             dispatched_at=NOW - 1, owner=OwnerStamp(pid=LIVE_PID, started_at=LIVE_STARTED), task=task,
             origin_session_id="o-9")
         c.prune_delegation_ledger()
+        # The caller exposes durable admission as bool; the storage verb is void.
+        return True
     before, after = run_ledger_both(backend, scope_a, monkeypatch, old, lambda: ad._persist_dispatch(record), verb)
     assert_same(before, after)
 

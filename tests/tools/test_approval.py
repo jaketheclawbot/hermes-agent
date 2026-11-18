@@ -109,6 +109,10 @@ class TestSmartApproval:
 
 
 class TestDetectDangerousRm:
+    def test_root_delete_stays_dangerous_after_home_normalization(self):
+        for root in (os.path.expanduser("~"), "~"):
+            assert detect_dangerous_command(f"rm -f {root}/not-a-verification-artifact")[0] is True
+
     def test_rm_flags_after_operands_detected(self):
         # GNU rm permutes options: `rm build/ -rf` == `rm -rf build/`.
         # Port of openai/codex#33464.
