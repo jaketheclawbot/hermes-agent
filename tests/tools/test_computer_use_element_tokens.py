@@ -124,7 +124,7 @@ class TestElementTokenAttachment:
             "is_on_screen": True, "title": "", "z_index": 0,
         }]}
 
-        def fake_call_tool(name, args):
+        def fake_call_tool(name, args, timeout=30.0):
             if name == "list_windows":
                 return {"data": "", "images": [], "image_mime_types": [],
                         "structuredContent": windows_payload, "isError": False}
