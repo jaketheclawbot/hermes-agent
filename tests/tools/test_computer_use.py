@@ -2192,6 +2192,7 @@ class TestElementTokenAttachment:
                 return cap in capabilities.get(tool, set())
             return any(cap in caps for caps in capabilities.values())
         backend._session.supports_capability = _supports
+        backend._session.supports_input_property = lambda tool, prop: prop == "element_index"
         backend._active_pid = 111
         backend._active_window_id = 222
         return backend
